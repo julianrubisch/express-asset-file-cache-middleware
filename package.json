@@ -20,5 +20,14 @@
   "bugs": {
     "url": "https://github.com/julianrubisch/express-asset-file-cache-middleware/issues"
   },
-  "homepage": "https://github.com/julianrubisch/express-asset-file-cache-middleware#readme"
+  "homepage": "https://github.com/julianrubisch/express-asset-file-cache-middleware#readme",
+  "dependencies": {
+    "node-fetch": "^2.6.0",
+    "sprintf-js": "^1.1.2"
+  },
+  "devDependencies": {
+    "chai": "^4.2.0",
+    "mocha": "^6.2.2",
+    "sinon": "^7.5.0"
+  }
 }
