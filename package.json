@@ -1,0 +1,24 @@
+{
+  "name": "express-asset-file-cache-middleware",
+  "version": "1.0.0",
+  "description": "An express.js middleware to locally cache assets (images, videos, audio, etc.) for faster access and proxying, for use in e.g. Electron apps",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/julianrubisch/express-asset-file-cache-middleware.git"
+  },
+  "keywords": [
+    "express.js",
+    "cache",
+    "middleware"
+  ],
+  "author": "Julian Rubisch",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/julianrubisch/express-asset-file-cache-middleware/issues"
+  },
+  "homepage": "https://github.com/julianrubisch/express-asset-file-cache-middleware#readme"
+}
