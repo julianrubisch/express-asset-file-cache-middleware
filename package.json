@@ -4,7 +4,7 @@
   "description": "An express.js middleware to locally cache assets (images, videos, audio, etc.) for faster access and proxying, for use in e.g. Electron apps",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "mocha"
   },
   "repository": {
     "type": "git",
@@ -28,6 +28,7 @@
   "devDependencies": {
     "chai": "^4.2.0",
     "mocha": "^6.2.2",
-    "sinon": "^7.5.0"
+    "sinon": "^7.5.0",
+    "sinon-chai": "^3.3.0"
   }
 }
