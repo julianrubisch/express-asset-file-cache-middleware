@@ -1,6 +1,7 @@
 const chai = require("chai");
 const sinon = require("sinon");
 const fs = require("fs");
+const path = require("path");
 const fetch = require("node-fetch");
 const sinonChai = require("sinon-chai");
 
@@ -17,6 +18,10 @@ describe("Middleware", function() {
         .withArgs(".")
         .returns(false);
       sinon.stub(fs, "mkdirSync");
+      sinon
+        .stub(path, "join")
+        .withArgs(process.cwd(), "/tmp")
+        .returns("/usr/src/app/tmp");
       sinon.stub(fetch, "Promise").resolves({
         headers: {
           get: sinon.stub()
@@ -25,7 +30,7 @@ describe("Middleware", function() {
           arrayBuffer: sinon.stub().resolves([])
         })
       });
-      sinon
+      this.makePathSpy = sinon
         .stub(middleware, "makeAssetCachePath")
         .returns({ dir1: "a1", dir2: "b2", path: "./a1/b2/0123456789abcdef" });
 
@@ -75,12 +80,51 @@ describe("Middleware", function() {
     });
 
     // it falls back to a default cache key
+    it("falls back to a default cache key", async function() {
+      sinon
+        .stub(fs, "existsSync")
+        .withArgs("./a1/b2/0123456789abcdef")
+        .returns(false);
+      const mw = middleware({ cacheDir: "." });
+
+      await mw(
+        {},
+        { locals: { fetchUrl: "https://www.example.org" } },
+        this.nextSpy
+      );
+
+      expect(this.nextSpy).to.have.been.calledOnce;
+      expect(this.makePathSpy).to.have.been.calledWith(
+        ".",
+        "https://www.example.org"
+      );
+    });
 
     // it falls back to a default cache directory
+    it("falls back to a default cache directory", async function() {
+      sinon
+        .stub(fs, "existsSync")
+        .withArgs("./a1/b2/0123456789abcdef")
+        .returns(false);
+      const mw = middleware();
+
+      await mw(
+        {},
+        { locals: { fetchUrl: "https://www.example.org" } },
+        this.nextSpy
+      );
+
+      expect(this.nextSpy).to.have.been.calledOnce;
+      expect(this.makePathSpy).to.have.been.calledWith(
+        "/usr/src/app/tmp",
+        "https://www.example.org"
+      );
+    });
 
     afterEach(function() {
       fs.existsSync.restore();
       this.nextSpy.resetHistory();
+      this.makePathSpy.resetHistory();
     });
   });
 });
