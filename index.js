@@ -44,9 +44,15 @@ function makeAssetCachePath(cacheDir, cacheKey) {
 
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
+    options = options || {};
+    options.cacheDir =
+      options && options.cacheDir
+        ? options.cacheDir
+        : path.join(process.cwd(), "/tmp");
+
     const { dir1, dir2, path: assetCachePath } = middleWare.makeAssetCachePath(
       options.cacheDir,
-      res.locals.cacheKey
+      res.locals.cacheKey || res.locals.fetchUrl
     );
 
     try {
@@ -89,7 +95,7 @@ const middleWare = (module.exports = function(options) {
 
       if (options.logger)
         options.logger.error(
-          `Caching asset ${res.locals.cacheKey} failed with error: ${e.message}`
+          `Caching asset at ${assetCachePath} failed with error: ${e.message}`
         );
 
       res.status(500).send(e.message);
