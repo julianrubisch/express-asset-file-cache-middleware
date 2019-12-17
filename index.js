@@ -42,8 +42,15 @@ function makeAssetCachePath(cacheDir, cacheKey) {
   };
 }
 
-function makeAssetCacheName(contentType, contentLength) {
+function encodeAssetCacheName(contentType, contentLength) {
   return Buffer.from(`${contentType}:${contentLength}`).toString("base64");
+}
+
+function decodeAssetCacheName(encodedString) {
+  const decodedFileName = Buffer.from(encodedString, "base64").toString(
+    "ascii"
+  );
+  return decodedFileName.split(":");
 }
 
 const middleWare = (module.exports = function(options) {
@@ -66,15 +73,16 @@ const middleWare = (module.exports = function(options) {
       middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
 
       if (fs.existsSync(assetCachePath)) {
-        if (options.logger)
-          options.logger.debug(`Reading buffer from path ${assetCachePath}`);
-
         const firstFile = fs.readdirSync(assetCachePath)[0];
-        const decodedFileName = Buffer.from("firstFile", "base64").toString(
-          "ascii"
-        );
 
-        const [contentType, contentLength] = decodedFileName.split(":");
+        if (options.logger)
+          options.logger.debug(
+            `Reading buffer from path ${assetCachePath}/${firstFile}`
+          );
+
+        const [contentType, contentLength] = middleWare.decodeAssetCacheName(
+          firstFile
+        );
 
         res.locals.contentLength = contentLength;
         res.locals.contentType = contentType;
@@ -83,21 +91,18 @@ const middleWare = (module.exports = function(options) {
       } else {
         const blob = await (await fetch(res.locals.fetchUrl)).blob();
 
+        const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
         if (options.logger)
-          options.logger.debug(`Writing buffer to path ${assetCachePath}`);
+          options.logger.debug(
+            `Writing buffer to path ${assetCachePath}/${fileName}`
+          );
 
         res.locals.buffer = Buffer.from(await blob.arrayBuffer(), "binary");
 
         res.locals.contentType = blob.type;
         res.locals.contentLength = blob.size;
 
-        fs.writeFileSync(
-          `${assetCachePath}/${middleWare.makeAssetCacheName(
-            blob.type,
-            blob.size
-          )}`,
-          res.locals.buffer
-        );
+        fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
       }
 
       next();
@@ -120,4 +125,5 @@ const middleWare = (module.exports = function(options) {
 
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
-middleWare.makeAssetCacheName = makeAssetCacheName;
+middleWare.encodeAssetCacheName = encodeAssetCacheName;
+middleWare.decodeAssetCacheName = decodeAssetCacheName;

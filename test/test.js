@@ -134,9 +134,17 @@ describe("Middleware", function() {
     });
   });
 
-  describe("asset cache name generation", function() {
-    expect(middleware.makeAssetCacheName("image/png", "4096")).to.equal(
-      "aW1hZ2UvcG5nOjQwOTY="
-    );
+  describe("asset cache name en/decoding", function() {
+    it("encodes contenttype and length to filename", function() {
+      expect(middleware.encodeAssetCacheName("image/png", "4096")).to.equal(
+        "aW1hZ2UvcG5nOjQwOTY="
+      );
+    });
+
+    it("retrieves contenttype and length from filename", function() {
+      expect(
+        middleware.decodeAssetCacheName("aW1hZ2UvcG5nOjQwOTY=")
+      ).to.deep.equal(["image/png", "4096"]);
+    });
   });
 });
