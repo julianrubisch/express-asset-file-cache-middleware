@@ -42,6 +42,10 @@ function makeAssetCachePath(cacheDir, cacheKey) {
   };
 }
 
+function makeAssetCacheName(contentType, contentLength) {
+  return Buffer.from(`${contentType}:${contentLength}`).toString("base64");
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
@@ -62,15 +66,20 @@ const middleWare = (module.exports = function(options) {
       middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
 
       if (fs.existsSync(assetCachePath)) {
-        const response = await fetch(res.locals.fetchUrl, { method: "HEAD" });
-
-        res.locals.contentLength = response.headers.get("content-length");
-        res.locals.contentType = response.headers.get("content-type");
-
         if (options.logger)
           options.logger.debug(`Reading buffer from path ${assetCachePath}`);
 
-        res.locals.buffer = fs.readFileSync(assetCachePath);
+        const firstFile = fs.readdirSync(assetCachePath)[0];
+        const decodedFileName = Buffer.from("firstFile", "base64").toString(
+          "ascii"
+        );
+
+        const [contentType, contentLength] = decodedFileName.split(":");
+
+        res.locals.contentLength = contentLength;
+        res.locals.contentType = contentType;
+
+        res.locals.buffer = fs.readFileSync(`${assetCachePath}/${firstFile}`);
       } else {
         const blob = await (await fetch(res.locals.fetchUrl)).blob();
 
@@ -82,7 +91,13 @@ const middleWare = (module.exports = function(options) {
         res.locals.contentType = blob.type;
         res.locals.contentLength = blob.size;
 
-        fs.writeFileSync(assetCachePath, res.locals.buffer);
+        fs.writeFileSync(
+          `${assetCachePath}/${middleWare.makeAssetCacheName(
+            blob.type,
+            blob.size
+          )}`,
+          res.locals.buffer
+        );
       }
 
       next();
@@ -105,3 +120,4 @@ const middleWare = (module.exports = function(options) {
 
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
+middleWare.makeAssetCacheName = makeAssetCacheName;

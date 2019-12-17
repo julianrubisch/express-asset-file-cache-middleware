@@ -53,7 +53,7 @@ describe("Middleware", function() {
 
       expect(this.nextSpy).to.have.been.calledOnce;
       expect(writeSpy).to.have.been.calledWith(
-        "./a1/b2/0123456789abcdef",
+        "./a1/b2/0123456789abcdef/dW5kZWZpbmVkOnVuZGVmaW5lZA==",
         Buffer.from([])
       );
     });
@@ -65,6 +65,10 @@ describe("Middleware", function() {
         .stub(fs, "existsSync")
         .withArgs("./a1/b2/0123456789abcdef")
         .returns(true);
+      sinon
+        .stub(fs, "readdirSync")
+        .withArgs("./a1/b2/0123456789abcdef")
+        .returns(["dW5kZWZpbmVkOnVuZGVmaW5lZA=="]);
       const mw = middleware({ cacheDir: "." });
 
       await mw(
@@ -75,7 +79,9 @@ describe("Middleware", function() {
 
       expect(this.nextSpy).to.have.been.calledOnce;
       expect(readSpy)
-        .to.have.been.calledWith("./a1/b2/0123456789abcdef")
+        .to.have.been.calledWith(
+          "./a1/b2/0123456789abcdef/dW5kZWZpbmVkOnVuZGVmaW5lZA=="
+        )
         .and.returned(Buffer.from([]));
     });
 
@@ -126,5 +132,11 @@ describe("Middleware", function() {
       this.nextSpy.resetHistory();
       this.makePathSpy.resetHistory();
     });
+  });
+
+  describe("asset cache name generation", function() {
+    expect(middleware.makeAssetCacheName("image/png", "4096")).to.equal(
+      "aW1hZ2UvcG5nOjQwOTY="
+    );
   });
 });
