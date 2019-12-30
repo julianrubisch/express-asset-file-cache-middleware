@@ -42,6 +42,17 @@ function makeAssetCachePath(cacheDir, cacheKey) {
   };
 }
 
+function encodeAssetCacheName(contentType, contentLength) {
+  return Buffer.from(`${contentType}:${contentLength}`).toString("base64");
+}
+
+function decodeAssetCacheName(encodedString) {
+  const decodedFileName = Buffer.from(encodedString, "base64").toString(
+    "ascii"
+  );
+  return decodedFileName.split(":");
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
@@ -62,27 +73,36 @@ const middleWare = (module.exports = function(options) {
       middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
 
       if (fs.existsSync(assetCachePath)) {
-        const response = await fetch(res.locals.fetchUrl, { method: "HEAD" });
-
-        res.locals.contentLength = response.headers.get("content-length");
-        res.locals.contentType = response.headers.get("content-type");
+        const firstFile = fs.readdirSync(assetCachePath)[0];
 
         if (options.logger)
-          options.logger.debug(`Reading buffer from path ${assetCachePath}`);
+          options.logger.debug(
+            `Reading buffer from path ${assetCachePath}/${firstFile}`
+          );
 
-        res.locals.buffer = fs.readFileSync(assetCachePath);
+        const [contentType, contentLength] = middleWare.decodeAssetCacheName(
+          firstFile
+        );
+
+        res.locals.contentLength = contentLength;
+        res.locals.contentType = contentType;
+
+        res.locals.buffer = fs.readFileSync(`${assetCachePath}/${firstFile}`);
       } else {
         const blob = await (await fetch(res.locals.fetchUrl)).blob();
 
+        const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
         if (options.logger)
-          options.logger.debug(`Writing buffer to path ${assetCachePath}`);
+          options.logger.debug(
+            `Writing buffer to path ${assetCachePath}/${fileName}`
+          );
 
         res.locals.buffer = Buffer.from(await blob.arrayBuffer(), "binary");
 
         res.locals.contentType = blob.type;
         res.locals.contentLength = blob.size;
 
-        fs.writeFileSync(assetCachePath, res.locals.buffer);
+        fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
       }
 
       next();
@@ -105,3 +125,5 @@ const middleWare = (module.exports = function(options) {
 
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
+middleWare.encodeAssetCacheName = encodeAssetCacheName;
+middleWare.decodeAssetCacheName = decodeAssetCacheName;
