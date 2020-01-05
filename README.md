@@ -42,7 +42,7 @@ app.listen(3000);
 
 It works by fetching your asset in between two callbacks on e.g. a route, by attaching a `fetchUrl` onto `res.locals`. When the asset isn't cached on disk already, it will write it into a directory specified by the option `cacheDir`. If it finds a file that's alread there, it will use that.
 
-Currently even when the file is present on disk, a `HEAD` request is necessary to determine `contentType` and `contentLength`, otherwise the response will fail (I will potentially mitigate this by optionally using an SQLite database, for _true_ offline use).
+The asset's `contentType` and `contentLength` are stored base64 encoded in the filename, thus no offline database is necessary
 
 Note that setting `cacheKey` and `cacheDir` isn't strictly necessary, it will fall back to `res.local.fetchUrl` and `path.join(process.cwd(), "/tmp")`, respectively.
 
