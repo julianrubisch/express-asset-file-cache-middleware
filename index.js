@@ -33,6 +33,7 @@ function makeAssetCachePath(cacheDir, cacheKey) {
   return {
     dir1: bucket1HexString,
     dir2: bucket2HexString,
+    dir3: hash.toString(),
     path: path.join(
       cacheDir,
       bucket1HexString,
@@ -61,17 +62,17 @@ const middleWare = (module.exports = function(options) {
         ? options.cacheDir
         : path.join(process.cwd(), "/tmp");
 
-    const { dir1, dir2, path: assetCachePath } = middleWare.makeAssetCachePath(
+    const {
+      dir1,
+      dir2,
+      dir3,
+      path: assetCachePath
+    } = middleWare.makeAssetCachePath(
       options.cacheDir,
       res.locals.cacheKey || res.locals.fetchUrl
     );
 
     try {
-      // node 10 supports recursive: true, but who knows?
-      middleWare.makeDirIfNotExists(options.cacheDir);
-      middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1));
-      middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
-
       if (fs.existsSync(assetCachePath)) {
         const firstFile = fs.readdirSync(assetCachePath)[0];
 
@@ -89,6 +90,14 @@ const middleWare = (module.exports = function(options) {
 
         res.locals.buffer = fs.readFileSync(`${assetCachePath}/${firstFile}`);
       } else {
+        // node 10 supports recursive: true, but who knows?
+        middleWare.makeDirIfNotExists(options.cacheDir);
+        middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1));
+        middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
+        middleWare.makeDirIfNotExists(
+          path.join(options.cacheDir, dir1, dir2, dir3)
+        );
+
         const blob = await (await fetch(res.locals.fetchUrl)).blob();
 
         const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
