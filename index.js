@@ -72,14 +72,11 @@ const middleWare = (module.exports = function(options) {
       res.locals.cacheKey || res.locals.fetchUrl
     );
 
+    const startTime = process.hrtime();
+
     try {
       if (fs.existsSync(assetCachePath)) {
         const firstFile = fs.readdirSync(assetCachePath)[0];
-
-        if (options.logger)
-          options.logger.debug(
-            `Reading buffer from path ${assetCachePath}/${firstFile}`
-          );
 
         const [contentType, contentLength] = middleWare.decodeAssetCacheName(
           firstFile
@@ -89,6 +86,14 @@ const middleWare = (module.exports = function(options) {
         res.locals.contentType = contentType;
 
         res.locals.buffer = fs.readFileSync(`${assetCachePath}/${firstFile}`);
+
+        const [seconds, nanoSeconds] = process.hrtime(startTime);
+        if (options.logger)
+          options.logger.info(
+            `Read buffer from path ${assetCachePath}/${firstFile} in ${seconds *
+              1000 +
+              nanoSeconds / 1e6} ms`
+          );
       } else {
         // node 10 supports recursive: true, but who knows?
         middleWare.makeDirIfNotExists(options.cacheDir);
@@ -101,10 +106,6 @@ const middleWare = (module.exports = function(options) {
         const blob = await (await fetch(res.locals.fetchUrl)).blob();
 
         const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
-        if (options.logger)
-          options.logger.debug(
-            `Writing buffer to path ${assetCachePath}/${fileName}`
-          );
 
         res.locals.buffer = Buffer.from(await blob.arrayBuffer(), "binary");
 
@@ -112,6 +113,14 @@ const middleWare = (module.exports = function(options) {
         res.locals.contentLength = blob.size;
 
         fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
+
+        const [seconds, nanoSeconds] = process.hrtime(startTime);
+        if (options.logger)
+          options.logger.info(
+            `Wrote buffer to path ${assetCachePath}/${fileName} in ${seconds *
+              1000 +
+              nanoSeconds / 1e6} ms`
+          );
       }
 
       next();
