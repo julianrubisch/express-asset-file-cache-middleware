@@ -30,6 +30,7 @@ describe("Middleware", function() {
           arrayBuffer: sinon.stub().resolves([])
         })
       });
+      sinon.stub(middleware, "evictLeastRecentlyUsed");
       this.makePathSpy = sinon
         .stub(middleware, "makeAssetCachePath")
         .returns({ dir1: "a1", dir2: "b2", path: "./a1/b2/0123456789abcdef" });
@@ -69,6 +70,8 @@ describe("Middleware", function() {
         .stub(fs, "readdirSync")
         .withArgs("./a1/b2/0123456789abcdef")
         .returns(["dW5kZWZpbmVkOnVuZGVmaW5lZA=="]);
+      sinon.stub(middleware, "touch");
+
       const mw = middleware({ cacheDir: "." });
 
       await mw(
@@ -83,6 +86,8 @@ describe("Middleware", function() {
           "./a1/b2/0123456789abcdef/dW5kZWZpbmVkOnVuZGVmaW5lZA=="
         )
         .and.returned(Buffer.from([]));
+
+      fs.readdirSync.restore();
     });
 
     // it falls back to a default cache key
@@ -132,6 +137,11 @@ describe("Middleware", function() {
       this.nextSpy.resetHistory();
       this.makePathSpy.resetHistory();
     });
+
+    after(function() {
+      path.join.restore();
+      middleware.evictLeastRecentlyUsed.restore();
+    });
   });
 
   describe("asset cache name en/decoding", function() {
@@ -145,6 +155,82 @@ describe("Middleware", function() {
       expect(
         middleware.decodeAssetCacheName("aW1hZ2UvcG5nOjQwOTY=")
       ).to.deep.equal(["image/png", "4096"]);
+    });
+  });
+
+  describe("evicting of least recently used files", function() {
+    before(function() {
+      sinon
+        .stub(fs, "readdirSync")
+        .withArgs("/tmp")
+        .returns(["test1", "test2"])
+        .withArgs("/tmp/test1")
+        .returns(["foo"])
+        .withArgs("/tmp/test2")
+        .returns(["bar"]);
+      sinon
+        .stub(fs, "statSync")
+        .withArgs("/tmp/test1")
+        .returns({
+          isDirectory() {
+            return true;
+          }
+        })
+        .withArgs("/tmp/test2")
+        .returns({
+          isDirectory() {
+            return true;
+          }
+        })
+        .withArgs("/tmp/test1")
+        .returns({
+          isDirectory() {
+            return true;
+          }
+        })
+        .withArgs("/tmp/test2")
+        .returns({
+          isDirectory() {
+            return true;
+          }
+        })
+        .withArgs("/tmp/test1/foo")
+        .returns({
+          isDirectory() {
+            return false;
+          },
+          atime: 1000
+        })
+        .withArgs("/tmp/test2/bar")
+        .returns({
+          isDirectory() {
+            return false;
+          },
+          atime: 2000
+        });
+      sinon
+        .stub(path, "join")
+        .withArgs("/tmp", "test1")
+        .returns("/tmp/test1")
+        .withArgs("/tmp/test1", "foo")
+        .returns("/tmp/test1/foo")
+        .withArgs("/tmp", "test2")
+        .returns("/tmp/test2")
+        .withArgs("/tmp/test2", "bar")
+        .returns("/tmp/test2/bar");
+    });
+
+    it("returns the least recently used file", function() {
+      expect(middleware.findLeastRecentlyUsed("/tmp")).to.deep.equal({
+        atime: 1000,
+        path: "/tmp/test1/foo"
+      });
+    });
+
+    after(function() {
+      fs.readdirSync.restore();
+      fs.statSync.restore();
+      path.join.restore();
     });
   });
 });
