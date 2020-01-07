@@ -85,7 +85,7 @@ function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
           logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
         }
 
-        evictLeastRecentlyUsed(cacheDir, maxSize);
+        evictLeastRecentlyUsed(cacheDir, maxSize, logger);
       } catch (e) {
         logger.error(e);
       }
