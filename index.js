@@ -54,6 +54,15 @@ function decodeAssetCacheName(encodedString) {
   return decodedFileName.split(":");
 }
 
+function touch(path) {
+  const time = new Date();
+  try {
+    fs.utimesSync(path, time, time);
+  } catch (err) {
+    fs.closeSync(fs.openSync(path, "w"));
+  }
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
@@ -77,6 +86,9 @@ const middleWare = (module.exports = function(options) {
     try {
       if (fs.existsSync(assetCachePath)) {
         const firstFile = fs.readdirSync(assetCachePath)[0];
+
+        // touch file for LRU eviction
+        touch(`${assetCachePath}/${firstFile}`);
 
         const [contentType, contentLength] = middleWare.decodeAssetCacheName(
           firstFile
