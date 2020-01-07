@@ -48,7 +48,7 @@ Note that setting `cacheKey` and `cacheDir` isn't strictly necessary, it will fa
 
 ## LRU Eviction
 
-To avoid cluttering your device, an LRU (least recently used) cache eviction strategy in place. Per default, when your cache dir grows over 1 GB of size, the least recently used (accessed) files will be evicted (deleted), until enough disk space is available again. You can change the cache dir size by specifying `options.maxSize` (in bytes) when creating the middleware.
+To avoid cluttering your device, an LRU (least recently used) cache eviction strategy is in place. Per default, when your cache dir grows over 1 GB of size, the least recently used (accessed) files will be evicted (deleted), until enough disk space is available again. You can change the cache dir size by specifying `options.maxSize` (in bytes) when creating the middleware.
 
 
 ## Install
