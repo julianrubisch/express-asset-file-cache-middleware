@@ -27,7 +27,7 @@ app.get(
     res.locals.cacheKey = `${someExpirableUniqueKey}`;
     next();
   },
-  fileCacheMiddleware({ cacheDir: "/tmp" }),
+  fileCacheMiddleware({ cacheDir: "/tmp", maxSize: 10 * 1024 * 1024 * 1024 }),
   (req, res) => {
     res.set({
       "Content-Type": res.locals.contentType,
@@ -45,6 +45,11 @@ It works by fetching your asset in between two callbacks on e.g. a route, by att
 The asset's `contentType` and `contentLength` are stored base64 encoded in the filename, thus no offline database is necessary
 
 Note that setting `cacheKey` and `cacheDir` isn't strictly necessary, it will fall back to `res.local.fetchUrl` and `path.join(process.cwd(), "/tmp")`, respectively.
+
+## LRU Eviction
+
+To avoid cluttering your device, an LRU (least recently used) cache eviction strategy is in place. Per default, when your cache dir grows over 1 GB of size, the least recently used (accessed) files will be evicted (deleted), until enough disk space is available again. You can change the cache dir size by specifying `options.maxSize` (in bytes) when creating the middleware.
+
 
 ## Install
 
@@ -100,6 +105,10 @@ The root directory where the file cache will be located. Falls back to `path.joi
 ### `logger` (optional)
 
 A logger to use for debugging, e.g. Winston, console, etc.
+
+### `maxSize` (optional)
+The maximum size of the cache directory, from which LRU eviction is applied. Defaults to 1 GB (1024 * 1024 * 1024).
+
 
 ## Tests
 

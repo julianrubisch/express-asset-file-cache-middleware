@@ -4,6 +4,8 @@ const sprintf = require("sprintf-js").sprintf;
 const fs = require("fs");
 const path = require("path");
 
+const getFolderSize = require("get-folder-size");
+
 function makeDirIfNotExists(dir) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir);
@@ -54,6 +56,67 @@ function decodeAssetCacheName(encodedString) {
   return decodedFileName.split(":");
 }
 
+function touch(path) {
+  const time = new Date();
+  try {
+    fs.utimesSync(path, time, time);
+  } catch (err) {
+    fs.closeSync(fs.openSync(path, "w"));
+  }
+}
+
+function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
+  getFolderSize(cacheDir, (err, size) => {
+    if (err) {
+      throw err;
+    }
+
+    if (size >= maxSize) {
+      try {
+        // find least recently used file
+        const leastRecentlyUsed = findLeastRecentlyUsed(cacheDir);
+
+        // and delete it
+        const { dir } = path.parse(leastRecentlyUsed.path);
+        fs.unlinkSync(leastRecentlyUsed.path);
+        fs.rmdirSync(dir);
+
+        if (logger) {
+          logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
+        }
+
+        evictLeastRecentlyUsed(cacheDir, maxSize, logger);
+      } catch (e) {
+        logger.error(e);
+      }
+    }
+  });
+}
+
+function findLeastRecentlyUsed(dir, result) {
+  let files = fs.readdirSync(dir);
+  result = result || { atime: Date.now(), path: "" };
+
+  files.forEach(file => {
+    const newBase = path.join(dir, file);
+
+    if (fs.statSync(newBase).isDirectory()) {
+      result = findLeastRecentlyUsed(newBase, result);
+    } else {
+      const { atime } = fs.statSync(newBase);
+
+      if (atime < result.atime) {
+        result = {
+          atime,
+          path: newBase
+        };
+      }
+    }
+  });
+
+  return result;
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
@@ -61,6 +124,8 @@ const middleWare = (module.exports = function(options) {
       options && options.cacheDir
         ? options.cacheDir
         : path.join(process.cwd(), "/tmp");
+    options.maxSize =
+      options && options.maxSize ? options.maxSize : 1024 * 1024 * 1024;
 
     const {
       dir1,
@@ -77,6 +142,9 @@ const middleWare = (module.exports = function(options) {
     try {
       if (fs.existsSync(assetCachePath)) {
         const firstFile = fs.readdirSync(assetCachePath)[0];
+
+        // touch file for LRU eviction
+        middleWare.touch(`${assetCachePath}/${firstFile}`);
 
         const [contentType, contentLength] = middleWare.decodeAssetCacheName(
           firstFile
@@ -112,6 +180,12 @@ const middleWare = (module.exports = function(options) {
         res.locals.contentType = blob.type;
         res.locals.contentLength = blob.size;
 
+        middleWare.evictLeastRecentlyUsed(
+          options.cacheDir,
+          options.maxSize,
+          options.logger
+        );
+
         fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
 
         const [seconds, nanoSeconds] = process.hrtime(startTime);
@@ -125,7 +199,6 @@ const middleWare = (module.exports = function(options) {
 
       next();
     } catch (e) {
-      console.log(e);
       // in case fs.writeFileSync writes partial data and fails
       if (fs.existsSync(assetCachePath)) {
         fs.unlinkSync(assetCachePath);
@@ -145,3 +218,6 @@ middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
 middleWare.encodeAssetCacheName = encodeAssetCacheName;
 middleWare.decodeAssetCacheName = decodeAssetCacheName;
+middleWare.findLeastRecentlyUsed = findLeastRecentlyUsed;
+middleWare.evictLeastRecentlyUsed = evictLeastRecentlyUsed;
+middleWare.touch = touch;
