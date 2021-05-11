@@ -171,7 +171,7 @@ const middleWare = (module.exports = function(options) {
           path.join(options.cacheDir, dir1, dir2, dir3)
         );
 
-        const blob = await (await fetch(res.locals.fetchUrl)).blob();
+        const blob = await (await fetch(res.locals.fetchUrl, res.locals.options)).blob();
 
         const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
 
