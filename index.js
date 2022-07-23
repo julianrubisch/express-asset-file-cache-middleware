@@ -117,8 +117,26 @@ function findLeastRecentlyUsed(dir, result) {
   return result;
 }
 
-const middleWare = (module.exports = function(options) {
-  return async function(req, res, next) {
+function deleteall(path) {
+  var files = [];
+  if (fs.existsSync(path)) {
+    files = fs.readdirSync(path);
+    files.forEach(function (file, index) {
+      var curPath = path + '/' + file;
+      if (fs.statSync(curPath).isDirectory()) {
+        // recurse
+        deleteall(curPath);
+      } else {
+        // delete file
+        fs.unlinkSync(curPath);
+      }
+    });
+    fs.rmdirSync(path);
+  }
+}
+
+const middleWare = (module.exports = function (options) {
+  return async function (req, res, next) {
     options = options || {};
     options.cacheDir =
       options && options.cacheDir
@@ -159,8 +177,8 @@ const middleWare = (module.exports = function(options) {
         if (options.logger)
           options.logger.info(
             `Read buffer from path ${assetCachePath}/${firstFile} in ${seconds *
-              1000 +
-              nanoSeconds / 1e6} ms`
+            1000 +
+            nanoSeconds / 1e6} ms`
           );
       } else {
         // node 10 supports recursive: true, but who knows?
@@ -192,18 +210,23 @@ const middleWare = (module.exports = function(options) {
         if (options.logger)
           options.logger.info(
             `Wrote buffer to path ${assetCachePath}/${fileName} in ${seconds *
-              1000 +
-              nanoSeconds / 1e6} ms`
+            1000 +
+            nanoSeconds / 1e6} ms`
           );
       }
 
       next();
     } catch (e) {
       // in case fs.writeFileSync writes partial data and fails
-      if (fs.existsSync(assetCachePath)) {
-        fs.unlinkSync(assetCachePath);
+      try {
+        if (fs.existsSync(assetCachePath)) {
+          deleteall(assetCachePath);
+        }
+      } catch(se) {
+        if(logger){
+          logger.error(se)
+        }
       }
-
       if (options.logger)
         options.logger.error(
           `Caching asset at ${assetCachePath} failed with error: ${e.message}`
@@ -213,6 +236,8 @@ const middleWare = (module.exports = function(options) {
     }
   };
 });
+
+
 
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
