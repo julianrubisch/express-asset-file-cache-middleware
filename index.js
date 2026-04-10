@@ -143,6 +143,13 @@ const middleWare = (module.exports = function(options) {
       if (fs.existsSync(assetCachePath)) {
         const firstFile = fs.readdirSync(assetCachePath)[0];
 
+        // Empty directory = corrupted cache entry, re-fetch
+        if (!firstFile) {
+          fs.rmdirSync(assetCachePath);
+          // Fall through to the fetch path by pretending the dir doesn't exist
+          return middleWare(options)(req, res, next);
+        }
+
         // touch file for LRU eviction
         middleWare.touch(`${assetCachePath}/${firstFile}`);
 
@@ -201,7 +208,11 @@ const middleWare = (module.exports = function(options) {
     } catch (e) {
       // in case fs.writeFileSync writes partial data and fails
       if (fs.existsSync(assetCachePath)) {
-        fs.unlinkSync(assetCachePath);
+        try {
+          fs.rmSync(assetCachePath, { recursive: true });
+        } catch (_) {
+          // ignore cleanup errors
+        }
       }
 
       if (options.logger)
