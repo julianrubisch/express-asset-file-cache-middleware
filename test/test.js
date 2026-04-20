@@ -144,6 +144,147 @@ describe("Middleware", function() {
     });
   });
 
+  describe("parseByteRange", function() {
+    it("returns null for missing or non-string header", function() {
+      expect(middleware.parseByteRange(undefined, 100)).to.equal(null);
+      expect(middleware.parseByteRange(null, 100)).to.equal(null);
+      expect(middleware.parseByteRange(42, 100)).to.equal(null);
+    });
+
+    it("returns null for malformed header", function() {
+      expect(middleware.parseByteRange("foo", 100)).to.equal(null);
+      expect(middleware.parseByteRange("items=0-10", 100)).to.equal(null);
+      expect(middleware.parseByteRange("bytes=-", 100)).to.equal(null);
+    });
+
+    it("parses bytes=start-end", function() {
+      expect(middleware.parseByteRange("bytes=0-99", 1000)).to.deep.equal({
+        start: 0,
+        end: 99
+      });
+      expect(middleware.parseByteRange("bytes=500-599", 1000)).to.deep.equal({
+        start: 500,
+        end: 599
+      });
+    });
+
+    it("parses open-ended bytes=start-", function() {
+      expect(middleware.parseByteRange("bytes=100-", 1000)).to.deep.equal({
+        start: 100,
+        end: 999
+      });
+    });
+
+    it("parses suffix range bytes=-N as last N bytes", function() {
+      expect(middleware.parseByteRange("bytes=-100", 1000)).to.deep.equal({
+        start: 900,
+        end: 999
+      });
+    });
+
+    it("clamps end to total-1 when it overflows", function() {
+      expect(middleware.parseByteRange("bytes=0-99999", 1000)).to.deep.equal({
+        start: 0,
+        end: 999
+      });
+    });
+
+    it("marks unsatisfiable when start >= total", function() {
+      expect(middleware.parseByteRange("bytes=9999-", 1000)).to.deep.equal({
+        unsatisfiable: true
+      });
+    });
+
+    it("marks unsatisfiable when start > end", function() {
+      expect(middleware.parseByteRange("bytes=500-100", 1000)).to.deep.equal({
+        unsatisfiable: true
+      });
+    });
+  });
+
+  describe("sendBuffer", function() {
+    function makeRes(buffer, contentType) {
+      return {
+        headers: {},
+        statusCode: 200,
+        locals: {
+          buffer,
+          contentType,
+          contentLength: String(buffer.length)
+        },
+        _body: null,
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        set(key, value) {
+          if (typeof key === "object") {
+            Object.assign(this.headers, key);
+          } else {
+            this.headers[key] = value;
+          }
+          return this;
+        },
+        end(body) {
+          this._body = body;
+          return this;
+        }
+      };
+    }
+
+    it("sends full body with Accept-Ranges when no Range header is present", function() {
+      const buf = Buffer.from("hello world");
+      const res = makeRes(buf, "text/plain");
+      middleware.sendBuffer({ headers: {} }, res);
+
+      expect(res.statusCode).to.equal(200);
+      expect(res.headers["Accept-Ranges"]).to.equal("bytes");
+      expect(res.headers["Content-Type"]).to.equal("text/plain");
+      expect(res.headers["Content-Length"]).to.equal(String(buf.length));
+      expect(res._body.equals(buf)).to.equal(true);
+    });
+
+    it("sends 206 Partial Content for a valid Range header", function() {
+      const buf = Buffer.from("0123456789");
+      const res = makeRes(buf, "application/octet-stream");
+      middleware.sendBuffer({ headers: { range: "bytes=2-5" } }, res);
+
+      expect(res.statusCode).to.equal(206);
+      expect(res.headers["Accept-Ranges"]).to.equal("bytes");
+      expect(res.headers["Content-Range"]).to.equal("bytes 2-5/10");
+      expect(res.headers["Content-Length"]).to.equal(4);
+      expect(res._body.toString()).to.equal("2345");
+    });
+
+    it("handles open-ended Range (bytes=N-)", function() {
+      const buf = Buffer.from("0123456789");
+      const res = makeRes(buf, "application/octet-stream");
+      middleware.sendBuffer({ headers: { range: "bytes=7-" } }, res);
+
+      expect(res.statusCode).to.equal(206);
+      expect(res.headers["Content-Range"]).to.equal("bytes 7-9/10");
+      expect(res._body.toString()).to.equal("789");
+    });
+
+    it("responds 416 for unsatisfiable Range", function() {
+      const buf = Buffer.from("0123456789");
+      const res = makeRes(buf, "application/octet-stream");
+      middleware.sendBuffer({ headers: { range: "bytes=9999-" } }, res);
+
+      expect(res.statusCode).to.equal(416);
+      expect(res.headers["Content-Range"]).to.equal("bytes */10");
+    });
+
+    it("falls back to 200 for malformed Range header", function() {
+      const buf = Buffer.from("0123456789");
+      const res = makeRes(buf, "application/octet-stream");
+      middleware.sendBuffer({ headers: { range: "foo" } }, res);
+
+      expect(res.statusCode).to.equal(200);
+      expect(res._body.equals(buf)).to.equal(true);
+    });
+  });
+
   describe("asset cache name en/decoding", function() {
     it("encodes contenttype and length to filename", function() {
       expect(middleware.encodeAssetCacheName("image/png", "4096")).to.equal(

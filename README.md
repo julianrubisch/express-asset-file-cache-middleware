@@ -42,6 +42,26 @@ app.listen(3000);
 
 It works by fetching your asset in between two callbacks on e.g. a route, by attaching a `fetchUrl` onto `res.locals`. When the asset isn't cached on disk already, it will write it into a directory specified by the option `cacheDir`. If it finds a file that's alread there, it will use that.
 
+### HTTP Range requests (video seeking, partial downloads)
+
+Since 1.4.0 the middleware supports HTTP Range requests, which is what browsers use for `<video>`/`<audio>` timeline seeking. Use the bundled `sendBuffer` helper as your final handler to get Range-aware responses for free:
+
+```javascript
+app.get(
+  "/assets/:asset_id",
+  async (req, res, next) => {
+    res.locals.fetchUrl = `https://cdn.example.org/path/to/actual/asset/${req.params.asset_id}`;
+    next();
+  },
+  fileCacheMiddleware({ cacheDir: "/tmp" }),
+  fileCacheMiddleware.sendBuffer
+);
+```
+
+`sendBuffer` emits `Accept-Ranges: bytes`, returns `206 Partial Content` with a `Content-Range` header when the client sends a valid `Range` header, and falls back to `200 OK` with the full body otherwise. Unsatisfiable ranges return `416 Range Not Satisfiable`.
+
+The middleware also now sets `Accept-Ranges: bytes` before calling `next()`, so even consumers that keep their own `res.end(res.locals.buffer)` response handler will get browser seek UI enabled (they still won't serve 206s, though — you need `sendBuffer` for that).
+
 The asset's `contentType` and `contentLength` are stored base64 encoded in the filename, thus no offline database is necessary
 
 Note that setting `cacheKey` and `cacheDir` isn't strictly necessary, it will fall back to `res.local.fetchUrl` and `path.join(process.cwd(), "/tmp")`, respectively.

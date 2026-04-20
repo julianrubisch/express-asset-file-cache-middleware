@@ -56,6 +56,75 @@ function decodeAssetCacheName(encodedString) {
   return decodedFileName.split(":");
 }
 
+function parseByteRange(rangeHeader, totalLength) {
+  if (!rangeHeader || typeof rangeHeader !== "string") return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match) return null;
+
+  const startStr = match[1];
+  const endStr = match[2];
+  let start;
+  let end;
+
+  if (startStr === "" && endStr === "") return null;
+
+  if (startStr === "") {
+    // suffix range: bytes=-N → last N bytes
+    const suffix = parseInt(endStr, 10);
+    if (suffix === 0) return { unsatisfiable: true };
+    start = Math.max(0, totalLength - suffix);
+    end = totalLength - 1;
+  } else {
+    start = parseInt(startStr, 10);
+    end = endStr === "" ? totalLength - 1 : parseInt(endStr, 10);
+  }
+
+  if (start > end || start >= totalLength) {
+    return { unsatisfiable: true };
+  }
+
+  if (end >= totalLength) end = totalLength - 1;
+
+  return { start, end };
+}
+
+function sendBuffer(req, res) {
+  const buffer = res.locals.buffer;
+  const total = buffer.length;
+  const contentType = res.locals.contentType;
+
+  res.set("Accept-Ranges", "bytes");
+
+  const range = parseByteRange(req.headers && req.headers.range, total);
+
+  if (range && range.unsatisfiable) {
+    res.status(416);
+    res.set({
+      "Content-Type": contentType,
+      "Content-Range": `bytes */${total}`
+    });
+    return res.end();
+  }
+
+  if (range) {
+    const { start, end } = range;
+    const slice = buffer.subarray(start, end + 1);
+    res.status(206);
+    res.set({
+      "Content-Type": contentType,
+      "Content-Range": `bytes ${start}-${end}/${total}`,
+      "Content-Length": slice.length
+    });
+    return res.end(slice, "binary");
+  }
+
+  res.set({
+    "Content-Type": contentType,
+    "Content-Length": res.locals.contentLength
+  });
+  res.end(buffer, "binary");
+}
+
 function touch(path) {
   const time = new Date();
   try {
@@ -204,6 +273,10 @@ const middleWare = (module.exports = function(options) {
           );
       }
 
+      if (res && typeof res.set === "function") {
+        res.set("Accept-Ranges", "bytes");
+      }
+
       next();
     } catch (e) {
       // in case fs.writeFileSync writes partial data and fails
@@ -232,3 +305,5 @@ middleWare.decodeAssetCacheName = decodeAssetCacheName;
 middleWare.findLeastRecentlyUsed = findLeastRecentlyUsed;
 middleWare.evictLeastRecentlyUsed = evictLeastRecentlyUsed;
 middleWare.touch = touch;
+middleWare.sendBuffer = sendBuffer;
+middleWare.parseByteRange = parseByteRange;
