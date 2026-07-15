@@ -1,13 +1,13 @@
-const chai = require("chai");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const http = require("http");
-const crypto = require("crypto");
+import * as chai from "chai";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import http from "http";
+import crypto from "crypto";
+
+import middleware from "../index.js";
 
 const expect = chai.expect;
-
-const middleware = require("../index");
 
 // End-to-end regression tests for the streaming cache-miss path (issue #26).
 // Unlike test/test.js these use a real local HTTP server and a real temp cache
