@@ -1,6 +1,16 @@
 name: Node CI
 
-on: [push, pull_request]
+on:
+  # Only run once per change: `pull_request` covers branches with an open PR,
+  # and `push` is scoped to master so it doesn't double up with the PR run.
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  # Cancel superseded runs for the same branch/PR (e.g. rapid pushes).
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
