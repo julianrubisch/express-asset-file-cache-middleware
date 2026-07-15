@@ -3,6 +3,10 @@ const crypto = require("crypto");
 const sprintf = require("sprintf-js").sprintf;
 const fs = require("fs");
 const path = require("path");
+const { pipeline, Transform } = require("stream");
+const { promisify } = require("util");
+
+const streamPipeline = promisify(pipeline);
 
 const getFolderSize = require("get-folder-size");
 
@@ -239,6 +243,16 @@ const middleWare = (module.exports = function(options) {
               nanoSeconds / 1e6} ms`
           );
       } else {
+        const response = await fetch(res.locals.fetchUrl);
+
+        // Never cache non-2xx responses: proxy the upstream status so the
+        // client sees the real error and the entry self-heals on retry.
+        if (!response.ok) {
+          return res
+            .status(response.status)
+            .send(response.statusText || "Upstream error");
+        }
+
         // node 10 supports recursive: true, but who knows?
         middleWare.makeDirIfNotExists(options.cacheDir);
         middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1));
@@ -247,14 +261,53 @@ const middleWare = (module.exports = function(options) {
           path.join(options.cacheDir, dir1, dir2, dir3)
         );
 
-        const blob = await (await fetch(res.locals.fetchUrl)).blob();
+        const contentType = response.headers.get("content-type") || "";
+        const totalHeader = response.headers.get("content-length");
+        const total =
+          totalHeader != null && totalHeader !== ""
+            ? parseInt(totalHeader, 10)
+            : null;
 
-        const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
+        // Stream to a temp file in the same directory, then atomically rename
+        // into place. A crashed or partial download never corrupts the cache.
+        const tmpPath = `${assetCachePath}/.tmp-${crypto
+          .randomBytes(8)
+          .toString("hex")}`;
 
-        res.locals.buffer = Buffer.from(await blob.arrayBuffer(), "binary");
+        let received = 0;
+        const counter = new Transform({
+          transform(chunk, _encoding, callback) {
+            received += chunk.length;
+            if (typeof options.onProgress === "function") {
+              options.onProgress({ received, total });
+            }
+            callback(null, chunk);
+          }
+        });
 
-        res.locals.contentType = blob.type;
-        res.locals.contentLength = blob.size;
+        try {
+          await streamPipeline(
+            response.body,
+            counter,
+            fs.createWriteStream(tmpPath)
+          );
+        } catch (streamErr) {
+          try {
+            fs.unlinkSync(tmpPath);
+          } catch (_) {
+            // ignore cleanup errors
+          }
+          throw streamErr;
+        }
+
+        // The number of bytes actually written is authoritative (the
+        // Content-Length header may be missing or wrong for chunked responses).
+        const contentLength = received;
+        const fileName = middleWare.encodeAssetCacheName(
+          contentType,
+          contentLength
+        );
+        const finalPath = `${assetCachePath}/${fileName}`;
 
         middleWare.evictLeastRecentlyUsed(
           options.cacheDir,
@@ -262,13 +315,16 @@ const middleWare = (module.exports = function(options) {
           options.logger
         );
 
-        fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
+        fs.renameSync(tmpPath, finalPath);
+
+        res.locals.contentType = contentType;
+        res.locals.contentLength = String(contentLength);
+        res.locals.buffer = fs.readFileSync(finalPath);
 
         const [seconds, nanoSeconds] = process.hrtime(startTime);
         if (options.logger)
           options.logger.info(
-            `Wrote buffer to path ${assetCachePath}/${fileName} in ${seconds *
-              1000 +
+            `Wrote buffer to path ${finalPath} in ${seconds * 1000 +
               nanoSeconds / 1e6} ms`
           );
       }
@@ -279,7 +335,7 @@ const middleWare = (module.exports = function(options) {
 
       next();
     } catch (e) {
-      // in case fs.writeFileSync writes partial data and fails
+      // in case the download/rename leaves a partial cache entry behind
       if (fs.existsSync(assetCachePath)) {
         try {
           fs.rmSync(assetCachePath, { recursive: true });
