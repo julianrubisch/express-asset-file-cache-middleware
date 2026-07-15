@@ -1,15 +1,15 @@
-const chai = require("chai");
-const sinon = require("sinon");
-const fs = require("fs");
-const path = require("path");
-const fetch = require("node-fetch");
-const sinonChai = require("sinon-chai");
-const { Readable, Writable } = require("stream");
+import * as chai from "chai";
+import sinon from "sinon";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
+import sinonChai from "sinon-chai";
+import { Readable, Writable } from "stream";
+
+import middleware from "../index.js";
 
 const expect = chai.expect;
 chai.use(sinonChai);
-
-const middleware = require("../index");
 
 describe("Middleware", function() {
   describe("request handler calling", function() {
