@@ -1,0 +1,23 @@
+# Dependabot configuration for scheduled version updates.
+# Security updates (for known vulnerabilities) are configured separately in
+# the repo's Security settings; this file enables routine dependency bumps.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # npm dependencies (package.json / package-lock.json in the repo root)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+
+  # GitHub Actions used by the workflows in .github/workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
