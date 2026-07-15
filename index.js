@@ -8,7 +8,9 @@ const { promisify } = require("util");
 
 const streamPipeline = promisify(pipeline);
 
-const getFolderSize = require("get-folder-size");
+// get-folder-size v5 is ESM-only, so it can't be `require`d from this
+// CommonJS module (that throws ERR_REQUIRE_ESM on Node < 22). It is loaded
+// lazily via dynamic import() inside evictLeastRecentlyUsed instead.
 
 function makeDirIfNotExists(dir) {
   if (!fs.existsSync(dir)) {
@@ -138,32 +140,34 @@ function touch(path) {
   }
 }
 
-function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
-  getFolderSize(cacheDir, (err, size) => {
-    if (err) {
-      throw err;
-    }
+async function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
+  // get-folder-size v5 is ESM-only; load it lazily so this CommonJS module
+  // stays requireable. `.loose()` returns the size directly and ignores
+  // transient read errors, which is what we want for best-effort eviction.
+  const { default: getFolderSize } = await import("get-folder-size");
 
-    if (size >= maxSize) {
-      try {
-        // find least recently used file
-        const leastRecentlyUsed = findLeastRecentlyUsed(cacheDir);
+  try {
+    let size = await getFolderSize.loose(cacheDir);
 
-        // and delete it
-        const { dir } = path.parse(leastRecentlyUsed.path);
-        fs.unlinkSync(leastRecentlyUsed.path);
-        fs.rmdirSync(dir);
+    while (size >= maxSize) {
+      // find and delete the least recently used file
+      const leastRecentlyUsed = findLeastRecentlyUsed(cacheDir);
 
-        if (logger) {
-          logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
-        }
+      const { dir } = path.parse(leastRecentlyUsed.path);
+      fs.unlinkSync(leastRecentlyUsed.path);
+      fs.rmdirSync(dir);
 
-        evictLeastRecentlyUsed(cacheDir, maxSize, logger);
-      } catch (e) {
-        logger.error(e);
+      if (logger) {
+        logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
       }
+
+      size = await getFolderSize.loose(cacheDir);
     }
-  });
+  } catch (e) {
+    if (logger) {
+      logger.error(e);
+    }
+  }
 }
 
 function findLeastRecentlyUsed(dir, result) {

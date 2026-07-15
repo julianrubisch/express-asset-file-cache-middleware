@@ -261,3 +261,59 @@ describe("streaming cache (integration)", function() {
     expect(sha).to.equal(ASSET_SHA);
   });
 });
+
+// Exercises the real eviction path against get-folder-size v5 (ESM, loaded
+// via dynamic import). The rest of the suite stubs eviction out, so this is
+// the only coverage of the get-folder-size integration.
+describe("evictLeastRecentlyUsed (integration, get-folder-size v5)", function() {
+  let cacheDir;
+
+  beforeEach(function() {
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "asset-cache-evict-"));
+  });
+
+  afterEach(function() {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  // Build a cache-shaped entry: <cacheDir>/b1/b2/<name>/blob
+  function writeEntry(name, bytes, atimeMs) {
+    const dir = path.join(cacheDir, "b1", "b2", name);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "blob");
+    fs.writeFileSync(file, Buffer.alloc(bytes, 1));
+    const t = new Date(atimeMs);
+    fs.utimesSync(file, t, t);
+    return file;
+  }
+
+  // Use MiB-scale files. get-folder-size counts directory-entry sizes too
+  // (~4 KiB per dir on ext4, ~0 on APFS), so small files would make the
+  // thresholds filesystem-dependent; MiB files dwarf that overhead.
+  const MiB = 1024 * 1024;
+
+  it("evicts least-recently-used entries until under maxSize", async function() {
+    const now = Date.now();
+    const oldest = writeEntry("oldest", MiB, now - 100000);
+    const newest = writeEntry("newest", MiB, now);
+
+    // ~2 MiB total; cap at 1.5 MiB so exactly one entry must be evicted
+    await middleware.evictLeastRecentlyUsed(cacheDir, 1.5 * MiB);
+
+    expect(fs.existsSync(oldest), "LRU entry should be evicted").to.equal(false);
+    expect(fs.existsSync(newest), "most-recent entry should survive").to.equal(
+      true
+    );
+  });
+
+  it("leaves the cache untouched when already under maxSize", async function() {
+    const now = Date.now();
+    const a = writeEntry("a", MiB, now - 100000);
+    const b = writeEntry("b", MiB, now);
+
+    await middleware.evictLeastRecentlyUsed(cacheDir, 100 * MiB);
+
+    expect(fs.existsSync(a)).to.equal(true);
+    expect(fs.existsSync(b)).to.equal(true);
+  });
+});
