@@ -27,7 +27,7 @@
     "sprintf-js": "^1.1.2"
   },
   "devDependencies": {
-    "chai": "^4.2.0",
+    "chai": "^6.2.2",
     "mocha": "^11.7.6",
     "sinon": "^7.5.0",
     "sinon-chai": "^3.3.0"
