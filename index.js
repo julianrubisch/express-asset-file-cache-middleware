@@ -214,6 +214,10 @@ const middleWare = (module.exports = function(options) {
       res.locals.cacheKey || res.locals.fetchUrl
     );
 
+    // Scoped here so the catch block can clean up this request's temp file
+    // without removing the shared cache directory, which a concurrent request
+    // for the same key may be using.
+    let tmpPath;
     const startTime = process.hrtime();
 
     try {
@@ -249,12 +253,30 @@ const middleWare = (module.exports = function(options) {
       } else {
         const response = await fetch(res.locals.fetchUrl);
 
-        // Never cache non-2xx responses: proxy the upstream status so the
-        // client sees the real error and the entry self-heals on retry.
+        // Never cache non-2xx responses: forward the upstream status,
+        // content-type and body so the client sees the real error. Reading the
+        // body also releases the keep-alive socket. The entry self-heals on the
+        // next request.
         if (!response.ok) {
+          const upstreamType = response.headers.get("content-type");
+          if (upstreamType && typeof res.set === "function") {
+            res.set("Content-Type", upstreamType);
+          }
+          const body = await response.text();
           return res
             .status(response.status)
-            .send(response.statusText || "Upstream error");
+            .send(body || response.statusText || "Upstream error");
+        }
+
+        // A 2xx response can carry no content to cache (204/205, or a null
+        // body). Respond with the status and short-circuit rather than caching
+        // an empty file.
+        if (
+          response.status === 204 ||
+          response.status === 205 ||
+          !response.body
+        ) {
+          return res.status(response.status).end();
         }
 
         // node 10 supports recursive: true, but who knows?
@@ -274,7 +296,7 @@ const middleWare = (module.exports = function(options) {
 
         // Stream to a temp file in the same directory, then atomically rename
         // into place. A crashed or partial download never corrupts the cache.
-        const tmpPath = `${assetCachePath}/.tmp-${crypto
+        tmpPath = `${assetCachePath}/.tmp-${crypto
           .randomBytes(8)
           .toString("hex")}`;
 
@@ -289,20 +311,13 @@ const middleWare = (module.exports = function(options) {
           }
         });
 
-        try {
-          await streamPipeline(
-            response.body,
-            counter,
-            fs.createWriteStream(tmpPath)
-          );
-        } catch (streamErr) {
-          try {
-            fs.unlinkSync(tmpPath);
-          } catch (_) {
-            // ignore cleanup errors
-          }
-          throw streamErr;
-        }
+        // On failure the outer catch removes tmpPath. A partial temp file is
+        // never renamed into place, so the published cache can't be corrupted.
+        await streamPipeline(
+          response.body,
+          counter,
+          fs.createWriteStream(tmpPath)
+        );
 
         // The number of bytes actually written is authoritative (the
         // Content-Length header may be missing or wrong for chunked responses).
@@ -319,7 +334,24 @@ const middleWare = (module.exports = function(options) {
           options.logger
         );
 
-        fs.renameSync(tmpPath, finalPath);
+        try {
+          fs.renameSync(tmpPath, finalPath);
+        } catch (renameErr) {
+          if (renameErr.code === "EEXIST") {
+            // A concurrent request for the same key already published this
+            // asset. Windows rename refuses to overwrite an existing file, so
+            // drop our temp copy and serve the one that is already there.
+            try {
+              fs.unlinkSync(tmpPath);
+            } catch (_) {
+              // ignore cleanup errors
+            }
+          } else {
+            throw renameErr;
+          }
+        }
+        // The temp file is gone (renamed or unlinked); nothing left to clean up.
+        tmpPath = undefined;
 
         res.locals.contentType = contentType;
         res.locals.contentLength = String(contentLength);
@@ -339,10 +371,12 @@ const middleWare = (module.exports = function(options) {
 
       next();
     } catch (e) {
-      // in case the download/rename leaves a partial cache entry behind
-      if (fs.existsSync(assetCachePath)) {
+      // Remove only this request's partial temp file. Never remove the shared
+      // cache directory: a concurrent request for the same key may have just
+      // published a valid file there.
+      if (tmpPath) {
         try {
-          fs.rmSync(assetCachePath, { recursive: true });
+          fs.unlinkSync(tmpPath);
         } catch (_) {
           // ignore cleanup errors
         }

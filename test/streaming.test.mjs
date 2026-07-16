@@ -1,4 +1,5 @@
 import * as chai from "chai";
+import sinon from "sinon";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -47,6 +48,10 @@ describe("streaming cache (integration)", function() {
         res.write(ASSET.subarray(0, ASSET.length / 2));
         res.write(ASSET.subarray(ASSET.length / 2));
         res.end();
+      } else if (req.url === "/empty") {
+        // 2xx with no body (node-fetch exposes response.body as null).
+        res.writeHead(204);
+        res.end();
       } else if (req.url === "/404") {
         res.writeHead(404, { "Content-Type": "text/html" });
         res.end("<h1>Not Found</h1>");
@@ -74,6 +79,7 @@ describe("streaming cache (integration)", function() {
   });
 
   afterEach(function() {
+    sinon.restore();
     fs.rmSync(cacheDir, { recursive: true, force: true });
   });
 
@@ -186,6 +192,9 @@ describe("streaming cache (integration)", function() {
 
     expect(result.ended).to.equal(true);
     expect(res404.statusCode).to.equal(404);
+    // The upstream content-type and body are forwarded to the client.
+    expect(res404.headers["Content-Type"]).to.match(/text\/html/);
+    expect(String(res404._body)).to.contain("Not Found");
     expect(findCachedFile(cacheDir), "nothing should be cached").to.equal(null);
 
     // A subsequent successful fetch for the same key now populates the cache.
@@ -195,6 +204,15 @@ describe("streaming cache (integration)", function() {
     });
     await run(resOk);
     expect(findCachedFile(cacheDir)).to.be.a("string");
+  });
+
+  it("responds without crashing for a 2xx with no body and caches nothing", async function() {
+    const res = makeRes({ fetchUrl: `${baseUrl}/empty` });
+    const result = await run(res);
+
+    expect(result.ended).to.equal(true);
+    expect(res.statusCode).to.equal(204);
+    expect(findCachedFile(cacheDir), "nothing should be cached").to.equal(null);
   });
 
   it("never caches a 500 response", async function() {
@@ -259,6 +277,62 @@ describe("streaming cache (integration)", function() {
       .update(fs.readFileSync(cached))
       .digest("hex");
     expect(sha).to.equal(ASSET_SHA);
+  });
+
+  it("serves the already-published file when rename hits EEXIST (Windows race)", async function() {
+    const { path: assetCachePath } = middleware.makeAssetCachePath(
+      cacheDir,
+      `${baseUrl}/asset`
+    );
+    const fileName = middleware.encodeAssetCacheName("image/png", ASSET.length);
+    fs.mkdirSync(assetCachePath, { recursive: true });
+    fs.writeFileSync(path.join(assetCachePath, fileName), ASSET);
+
+    // Force the miss path (dir "absent") and simulate Windows refusing to
+    // overwrite the file a concurrent request just published.
+    sinon.stub(middleware, "makeDirIfNotExists");
+    sinon
+      .stub(fs, "existsSync")
+      .callThrough()
+      .withArgs(assetCachePath)
+      .returns(false);
+    const eexist = new Error("EEXIST: file already exists");
+    eexist.code = "EEXIST";
+    sinon.stub(fs, "renameSync").throws(eexist);
+
+    const res = makeRes({ fetchUrl: `${baseUrl}/asset` });
+    const result = await run(res);
+
+    expect(result.next, "should call next(), not 500").to.equal(true);
+    expect(res.locals.buffer.equals(ASSET)).to.equal(true);
+  });
+
+  it("removes only the temp file (not a sibling) when publishing fails", async function() {
+    const { path: assetCachePath } = middleware.makeAssetCachePath(
+      cacheDir,
+      `${baseUrl}/asset`
+    );
+    fs.mkdirSync(assetCachePath, { recursive: true });
+    // A file a concurrent request for the same key already published.
+    const sibling = path.join(assetCachePath, "sibling");
+    fs.writeFileSync(sibling, Buffer.from("keep me"));
+
+    sinon.stub(middleware, "makeDirIfNotExists");
+    sinon
+      .stub(fs, "existsSync")
+      .callThrough()
+      .withArgs(assetCachePath)
+      .returns(false);
+    // Fail publishing after the temp file has been written.
+    sinon.stub(fs, "renameSync").throws(new Error("EIO"));
+
+    const res = makeRes({ fetchUrl: `${baseUrl}/asset` });
+    const result = await run(res);
+
+    expect(result.ended, "middleware should respond 500").to.equal(true);
+    expect(res.statusCode).to.equal(500);
+    // The sibling survives; only this request's temp file was removed.
+    expect(fs.readdirSync(assetCachePath)).to.deep.equal(["sibling"]);
   });
 });
 
