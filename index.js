@@ -129,8 +129,11 @@ function touch(path) {
   const time = new Date();
   try {
     fs.utimesSync(path, time, time);
-  } catch (err) {
-    fs.closeSync(fs.openSync(path, "w"));
+  } catch (_) {
+    // Best-effort LRU timestamp bump. If utimesSync fails, leave the file
+    // untouched: the previous fallback opened it with the "w" flag, which
+    // truncated the cached asset to zero bytes (#42). LRU accuracy is never
+    // worth corrupting a cached file.
   }
 }
 
