@@ -42,6 +42,8 @@ app.listen(3000);
 
 It works by fetching your asset in between two callbacks on e.g. a route, by attaching a `fetchUrl` onto `res.locals`. When the asset isn't cached on disk already, it will write it into a directory specified by the option `cacheDir`. If it finds a file that's alread there, it will use that.
 
+On a cache miss the response body is **streamed straight to disk** (instead of being buffered entirely in memory), written to a temporary file and then **atomically renamed** into place, so an interrupted or partial download can never leave a corrupt cache entry. Non-2xx upstream responses (401/403/404/429/5xx, …) are **never cached** - the upstream status is proxied back to the client so the entry self-heals on the next request.
+
 ### HTTP Range requests (video seeking, partial downloads)
 
 Since 1.4.0 the middleware supports HTTP Range requests, which is what browsers use for `<video>`/`<audio>` timeline seeking. Use the bundled `sendBuffer` helper as your final handler to get Range-aware responses for free:
@@ -128,6 +130,25 @@ A logger to use for debugging, e.g. Winston, console, etc.
 
 ### `maxSize` (optional)
 The maximum size of the cache directory, from which LRU eviction is applied. Defaults to 1 GB (1024 * 1024 * 1024).
+
+### `onProgress` (optional)
+
+A callback invoked repeatedly while an asset is being streamed to disk on a cache miss, useful for driving download-progress UIs. It receives an object `{ received, total }`:
+
+- `received` - the number of bytes written so far (monotonically increasing, ending at the full size).
+- `total` - the expected size from the upstream `Content-Length` header, or `null` when the server doesn't send one (e.g. chunked responses).
+
+```javascript
+fileCacheMiddleware({
+  cacheDir: "/tmp",
+  onProgress: ({ received, total }) => {
+    const pct = total ? Math.round((received / total) * 100) : null;
+    console.log(`downloaded ${received} bytes${pct !== null ? ` (${pct}%)` : ""}`);
+  }
+});
+```
+
+It is only called on a cache miss (an actual download); cache hits are served from disk and emit no progress events.
 
 
 ## Tests

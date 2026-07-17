@@ -3,8 +3,14 @@ const crypto = require("crypto");
 const sprintf = require("sprintf-js").sprintf;
 const fs = require("fs");
 const path = require("path");
+const { pipeline, Transform } = require("stream");
+const { promisify } = require("util");
 
-const getFolderSize = require("get-folder-size");
+const streamPipeline = promisify(pipeline);
+
+// get-folder-size v5 is ESM-only, so it can't be `require`d from this
+// CommonJS module (that throws ERR_REQUIRE_ESM on Node < 22). It is loaded
+// lazily via dynamic import() inside evictLeastRecentlyUsed instead.
 
 function makeDirIfNotExists(dir) {
   if (!fs.existsSync(dir)) {
@@ -137,32 +143,34 @@ function touch(path) {
   }
 }
 
-function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
-  getFolderSize(cacheDir, (err, size) => {
-    if (err) {
-      throw err;
-    }
+async function evictLeastRecentlyUsed(cacheDir, maxSize, logger) {
+  // get-folder-size v5 is ESM-only; load it lazily so this CommonJS module
+  // stays requireable. `.loose()` returns the size directly and ignores
+  // transient read errors, which is what we want for best-effort eviction.
+  const { default: getFolderSize } = await import("get-folder-size");
 
-    if (size >= maxSize) {
-      try {
-        // find least recently used file
-        const leastRecentlyUsed = findLeastRecentlyUsed(cacheDir);
+  try {
+    let size = await getFolderSize.loose(cacheDir);
 
-        // and delete it
-        const { dir } = path.parse(leastRecentlyUsed.path);
-        fs.unlinkSync(leastRecentlyUsed.path);
-        fs.rmdirSync(dir);
+    while (size >= maxSize) {
+      // find and delete the least recently used file
+      const leastRecentlyUsed = findLeastRecentlyUsed(cacheDir);
 
-        if (logger) {
-          logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
-        }
+      const { dir } = path.parse(leastRecentlyUsed.path);
+      fs.unlinkSync(leastRecentlyUsed.path);
+      fs.rmdirSync(dir);
 
-        evictLeastRecentlyUsed(cacheDir, maxSize, logger);
-      } catch (e) {
-        logger.error(e);
+      if (logger) {
+        logger.info(`Evicted ${leastRecentlyUsed.path} from cache`);
       }
+
+      size = await getFolderSize.loose(cacheDir);
     }
-  });
+  } catch (e) {
+    if (logger) {
+      logger.error(e);
+    }
+  }
 }
 
 function findLeastRecentlyUsed(dir, result) {
@@ -209,6 +217,10 @@ const middleWare = (module.exports = function(options) {
       res.locals.cacheKey || res.locals.fetchUrl
     );
 
+    // Scoped here so the catch block can clean up this request's temp file
+    // without removing the shared cache directory, which a concurrent request
+    // for the same key may be using.
+    let tmpPath;
     const startTime = process.hrtime();
 
     try {
@@ -242,6 +254,34 @@ const middleWare = (module.exports = function(options) {
               nanoSeconds / 1e6} ms`
           );
       } else {
+        const response = await fetch(res.locals.fetchUrl);
+
+        // Never cache non-2xx responses: forward the upstream status,
+        // content-type and body so the client sees the real error. Reading the
+        // body also releases the keep-alive socket. The entry self-heals on the
+        // next request.
+        if (!response.ok) {
+          const upstreamType = response.headers.get("content-type");
+          if (upstreamType && typeof res.set === "function") {
+            res.set("Content-Type", upstreamType);
+          }
+          const body = await response.text();
+          return res
+            .status(response.status)
+            .send(body || response.statusText || "Upstream error");
+        }
+
+        // A 2xx response can carry no content to cache (204/205, or a null
+        // body). Respond with the status and short-circuit rather than caching
+        // an empty file.
+        if (
+          response.status === 204 ||
+          response.status === 205 ||
+          !response.body
+        ) {
+          return res.status(response.status).end();
+        }
+
         // node 10 supports recursive: true, but who knows?
         middleWare.makeDirIfNotExists(options.cacheDir);
         middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1));
@@ -250,14 +290,46 @@ const middleWare = (module.exports = function(options) {
           path.join(options.cacheDir, dir1, dir2, dir3)
         );
 
-        const blob = await (await fetch(res.locals.fetchUrl)).blob();
+        const contentType = response.headers.get("content-type") || "";
+        const totalHeader = response.headers.get("content-length");
+        const total =
+          totalHeader != null && totalHeader !== ""
+            ? parseInt(totalHeader, 10)
+            : null;
 
-        const fileName = middleWare.encodeAssetCacheName(blob.type, blob.size);
+        // Stream to a temp file in the same directory, then atomically rename
+        // into place. A crashed or partial download never corrupts the cache.
+        tmpPath = `${assetCachePath}/.tmp-${crypto
+          .randomBytes(8)
+          .toString("hex")}`;
 
-        res.locals.buffer = Buffer.from(await blob.arrayBuffer(), "binary");
+        let received = 0;
+        const counter = new Transform({
+          transform(chunk, _encoding, callback) {
+            received += chunk.length;
+            if (typeof options.onProgress === "function") {
+              options.onProgress({ received, total });
+            }
+            callback(null, chunk);
+          }
+        });
 
-        res.locals.contentType = blob.type;
-        res.locals.contentLength = blob.size;
+        // On failure the outer catch removes tmpPath. A partial temp file is
+        // never renamed into place, so the published cache can't be corrupted.
+        await streamPipeline(
+          response.body,
+          counter,
+          fs.createWriteStream(tmpPath)
+        );
+
+        // The number of bytes actually written is authoritative (the
+        // Content-Length header may be missing or wrong for chunked responses).
+        const contentLength = received;
+        const fileName = middleWare.encodeAssetCacheName(
+          contentType,
+          contentLength
+        );
+        const finalPath = `${assetCachePath}/${fileName}`;
 
         middleWare.evictLeastRecentlyUsed(
           options.cacheDir,
@@ -265,13 +337,33 @@ const middleWare = (module.exports = function(options) {
           options.logger
         );
 
-        fs.writeFileSync(`${assetCachePath}/${fileName}`, res.locals.buffer);
+        try {
+          fs.renameSync(tmpPath, finalPath);
+        } catch (renameErr) {
+          if (renameErr.code === "EEXIST") {
+            // A concurrent request for the same key already published this
+            // asset. Windows rename refuses to overwrite an existing file, so
+            // drop our temp copy and serve the one that is already there.
+            try {
+              fs.unlinkSync(tmpPath);
+            } catch (_) {
+              // ignore cleanup errors
+            }
+          } else {
+            throw renameErr;
+          }
+        }
+        // The temp file is gone (renamed or unlinked); nothing left to clean up.
+        tmpPath = undefined;
+
+        res.locals.contentType = contentType;
+        res.locals.contentLength = String(contentLength);
+        res.locals.buffer = fs.readFileSync(finalPath);
 
         const [seconds, nanoSeconds] = process.hrtime(startTime);
         if (options.logger)
           options.logger.info(
-            `Wrote buffer to path ${assetCachePath}/${fileName} in ${seconds *
-              1000 +
+            `Wrote buffer to path ${finalPath} in ${seconds * 1000 +
               nanoSeconds / 1e6} ms`
           );
       }
@@ -282,10 +374,12 @@ const middleWare = (module.exports = function(options) {
 
       next();
     } catch (e) {
-      // in case fs.writeFileSync writes partial data and fails
-      if (fs.existsSync(assetCachePath)) {
+      // Remove only this request's partial temp file. Never remove the shared
+      // cache directory: a concurrent request for the same key may have just
+      // published a valid file there.
+      if (tmpPath) {
         try {
-          fs.rmSync(assetCachePath, { recursive: true });
+          fs.unlinkSync(tmpPath);
         } catch (_) {
           // ignore cleanup errors
         }

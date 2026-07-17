@@ -1,14 +1,15 @@
-const chai = require("chai");
-const sinon = require("sinon");
-const fs = require("fs");
-const path = require("path");
-const fetch = require("node-fetch");
-const sinonChai = require("sinon-chai");
+import * as chai from "chai";
+import sinon from "sinon";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
+import sinonChai from "sinon-chai";
+import { Readable, Writable } from "stream";
+
+import middleware from "../index.js";
 
 const expect = chai.expect;
 chai.use(sinonChai);
-
-const middleware = require("../index");
 
 describe("Middleware", function() {
   describe("request handler calling", function() {
@@ -23,13 +24,30 @@ describe("Middleware", function() {
         .withArgs(process.cwd(), "/tmp")
         .returns("/usr/src/app/tmp");
       sinon.stub(fetch, "Promise").resolves({
+        ok: true,
+        status: 200,
+        statusText: "OK",
         headers: {
-          get: sinon.stub()
+          get(header) {
+            if (header === "content-type") return "";
+            if (header === "content-length") return "0";
+            return null;
+          }
         },
-        blob: sinon.stub().returns({
-          arrayBuffer: sinon.stub().resolves([])
-        })
+        // node-fetch v2 exposes the body as a Node Readable stream; use a
+        // getter so every fetch call in this suite gets a fresh, unconsumed
+        // stream (a Readable can only be read once).
+        get body() {
+          return Readable.from([]);
+        }
       });
+      // the streaming path writes to a temp file then atomically renames it,
+      // then reads the finished file back into res.locals.buffer
+      sinon
+        .stub(fs, "createWriteStream")
+        .callsFake(() => new Writable({ write: (c, e, cb) => cb() }));
+      sinon.stub(fs, "renameSync");
+      this.readSpy = sinon.stub(fs, "readFileSync").returns(Buffer.from([]));
       sinon.stub(middleware, "evictLeastRecentlyUsed");
       this.makePathSpy = sinon
         .stub(middleware, "makeAssetCachePath")
@@ -38,8 +56,7 @@ describe("Middleware", function() {
       this.nextSpy = sinon.spy();
     });
 
-    it("writes to the cache if file is not present", async function() {
-      const writeSpy = sinon.stub(fs, "writeFileSync");
+    it("streams to the cache and renames atomically if file is not present", async function() {
       sinon
         .stub(fs, "existsSync")
         .withArgs("./a1/b2/0123456789abcdef")
@@ -53,15 +70,14 @@ describe("Middleware", function() {
       );
 
       expect(this.nextSpy).to.have.been.calledOnce;
-      expect(writeSpy).to.have.been.calledWith(
-        "./a1/b2/0123456789abcdef/dW5kZWZpbmVkOnVuZGVmaW5lZA==",
-        Buffer.from([])
+      // content-type "" and 0 bytes received encode to base64(":0") = "OjA="
+      expect(fs.renameSync).to.have.been.calledWith(
+        sinon.match(/^\.\/a1\/b2\/0123456789abcdef\/\.tmp-[0-9a-f]{16}$/),
+        "./a1/b2/0123456789abcdef/OjA="
       );
     });
 
     it("reads from the file cache if file is present", async function() {
-      const readSpy = sinon.stub(fs, "readFileSync").returns(Buffer.from([]));
-
       sinon
         .stub(fs, "existsSync")
         .withArgs("./a1/b2/0123456789abcdef")
@@ -81,13 +97,14 @@ describe("Middleware", function() {
       );
 
       expect(this.nextSpy).to.have.been.calledOnce;
-      expect(readSpy)
+      expect(this.readSpy)
         .to.have.been.calledWith(
           "./a1/b2/0123456789abcdef/dW5kZWZpbmVkOnVuZGVmaW5lZA=="
         )
         .and.returned(Buffer.from([]));
 
       fs.readdirSync.restore();
+      middleware.touch.restore();
     });
 
     // it falls back to a default cache key
@@ -136,11 +153,23 @@ describe("Middleware", function() {
       fs.existsSync.restore();
       this.nextSpy.resetHistory();
       this.makePathSpy.resetHistory();
+      this.readSpy.resetHistory();
+      fs.renameSync.resetHistory();
+      fs.createWriteStream.resetHistory();
     });
 
     after(function() {
+      // Restore every stub set up in `before` so real fs/fetch is available
+      // to the integration suite (Mocha runs all spec files in one process).
       path.join.restore();
       middleware.evictLeastRecentlyUsed.restore();
+      middleware.makeAssetCachePath.restore();
+      middleware.makeDirIfNotExists.restore();
+      fetch.Promise.restore();
+      fs.mkdirSync.restore();
+      fs.createWriteStream.restore();
+      fs.renameSync.restore();
+      fs.readFileSync.restore();
     });
   });
 
