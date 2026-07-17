@@ -197,176 +197,236 @@ function findLeastRecentlyUsed(dir, result) {
   return result;
 }
 
+/**
+ * Fetch an asset and cache it on disk, or resolve it straight from the cache.
+ *
+ * This is the whole download/cache/progress core with no HTTP transport
+ * attached, so a non-Express caller (an Electron main process, a CLI precache,
+ * a queue worker) can use it directly. The middleware below is a thin adapter
+ * over it.
+ *
+ * @param {string} fetchUrl
+ * @param {object} [opts]
+ * @param {string} [opts.cacheDir=<cwd>/tmp]
+ * @param {string} [opts.cacheKey=fetchUrl] cache path / dedupe key
+ * @param {number} [opts.maxSize=1GiB] LRU ceiling for the cache directory
+ * @param {(progress: { received: number, total: number|null }) => void} [opts.onProgress]
+ *   Called per chunk on a cache miss. `total` comes from Content-Length and is
+ *   null when the upstream response is chunked.
+ * @param {object} [opts.logger]
+ * @returns {Promise<
+ *   | { status: "cached", fromCache: boolean, path: string, contentType: string, contentLength: string }
+ *   | { status: "error", httpStatus: number, statusText: string, contentType: string|null, body: string }
+ *   | { status: "empty", httpStatus: number }
+ * >}
+ *   Rejects on filesystem/stream errors, after unlinking its own temp file.
+ */
+async function cacheAsset(fetchUrl, opts) {
+  opts = opts || {};
+  const cacheDir = opts.cacheDir || path.join(process.cwd(), "/tmp");
+  const maxSize = opts.maxSize || 1024 * 1024 * 1024;
+  const cacheKey = opts.cacheKey || fetchUrl;
+  const logger = opts.logger;
+
+  const {
+    dir1,
+    dir2,
+    dir3,
+    path: assetCachePath
+  } = middleWare.makeAssetCachePath(cacheDir, cacheKey);
+
+  // Scoped here so the catch block can clean up this call's temp file without
+  // removing the shared cache directory, which a concurrent call for the same
+  // key may be using.
+  let tmpPath;
+  const startTime = process.hrtime();
+
+  try {
+    if (fs.existsSync(assetCachePath)) {
+      const firstFile = fs.readdirSync(assetCachePath)[0];
+
+      // Empty directory = corrupted cache entry, re-fetch
+      if (!firstFile) {
+        fs.rmdirSync(assetCachePath);
+        // Fall through to the fetch path by pretending the dir doesn't exist
+        return middleWare.cacheAsset(fetchUrl, opts);
+      }
+
+      // touch file for LRU eviction
+      middleWare.touch(`${assetCachePath}/${firstFile}`);
+
+      const [contentType, contentLength] = middleWare.decodeAssetCacheName(
+        firstFile
+      );
+
+      const [seconds, nanoSeconds] = process.hrtime(startTime);
+      if (logger)
+        logger.info(
+          `Cache hit for path ${assetCachePath}/${firstFile} in ${seconds *
+            1000 +
+            nanoSeconds / 1e6} ms`
+        );
+
+      return {
+        status: "cached",
+        fromCache: true,
+        path: `${assetCachePath}/${firstFile}`,
+        contentType,
+        contentLength
+      };
+    }
+
+    const response = await fetch(fetchUrl);
+
+    // Never cache non-2xx responses: report the upstream status, content-type
+    // and body so the caller can surface the real error. Reading the body also
+    // releases the keep-alive socket. The entry self-heals on the next call.
+    if (!response.ok) {
+      const body = await response.text();
+      return {
+        status: "error",
+        httpStatus: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get("content-type"),
+        body
+      };
+    }
+
+    // A 2xx response can carry no content to cache (204/205, or a null body).
+    // Report the status and short-circuit rather than caching an empty file.
+    if (response.status === 204 || response.status === 205 || !response.body) {
+      return { status: "empty", httpStatus: response.status };
+    }
+
+    // node 10 supports recursive: true, but who knows?
+    middleWare.makeDirIfNotExists(cacheDir);
+    middleWare.makeDirIfNotExists(path.join(cacheDir, dir1));
+    middleWare.makeDirIfNotExists(path.join(cacheDir, dir1, dir2));
+    middleWare.makeDirIfNotExists(path.join(cacheDir, dir1, dir2, dir3));
+
+    const contentType = response.headers.get("content-type") || "";
+    const totalHeader = response.headers.get("content-length");
+    const total =
+      totalHeader != null && totalHeader !== ""
+        ? parseInt(totalHeader, 10)
+        : null;
+
+    // Stream to a temp file in the same directory, then atomically rename into
+    // place. A crashed or partial download never corrupts the cache.
+    tmpPath = `${assetCachePath}/.tmp-${crypto.randomBytes(8).toString("hex")}`;
+
+    let received = 0;
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        received += chunk.length;
+        if (typeof opts.onProgress === "function") {
+          opts.onProgress({ received, total });
+        }
+        callback(null, chunk);
+      }
+    });
+
+    // On failure the outer catch removes tmpPath. A partial temp file is never
+    // renamed into place, so the published cache can't be corrupted.
+    await streamPipeline(response.body, counter, fs.createWriteStream(tmpPath));
+
+    // The number of bytes actually written is authoritative (the
+    // Content-Length header may be missing or wrong for chunked responses).
+    const contentLength = received;
+    const fileName = middleWare.encodeAssetCacheName(
+      contentType,
+      contentLength
+    );
+    const finalPath = `${assetCachePath}/${fileName}`;
+
+    middleWare.evictLeastRecentlyUsed(cacheDir, maxSize, logger);
+
+    try {
+      fs.renameSync(tmpPath, finalPath);
+    } catch (renameErr) {
+      if (renameErr.code === "EEXIST") {
+        // A concurrent call for the same key already published this asset.
+        // Windows rename refuses to overwrite an existing file, so drop our
+        // temp copy and use the one that is already there.
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch (_) {
+          // ignore cleanup errors
+        }
+      } else {
+        throw renameErr;
+      }
+    }
+    // The temp file is gone (renamed or unlinked); nothing left to clean up.
+    tmpPath = undefined;
+
+    const [seconds, nanoSeconds] = process.hrtime(startTime);
+    if (logger)
+      logger.info(
+        `Wrote asset to path ${finalPath} in ${seconds * 1000 +
+          nanoSeconds / 1e6} ms`
+      );
+
+    return {
+      status: "cached",
+      fromCache: false,
+      path: finalPath,
+      contentType,
+      contentLength: String(contentLength)
+    };
+  } catch (e) {
+    // Remove only this call's partial temp file. Never remove the shared cache
+    // directory: a concurrent call for the same key may have just published a
+    // valid file there.
+    if (tmpPath) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (_) {
+        // ignore cleanup errors
+      }
+    }
+
+    if (logger)
+      logger.error(
+        `Caching asset at ${assetCachePath} failed with error: ${e.message}`
+      );
+
+    throw e;
+  }
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
-    options.cacheDir =
-      options && options.cacheDir
-        ? options.cacheDir
-        : path.join(process.cwd(), "/tmp");
-    options.maxSize =
-      options && options.maxSize ? options.maxSize : 1024 * 1024 * 1024;
-
-    const {
-      dir1,
-      dir2,
-      dir3,
-      path: assetCachePath
-    } = middleWare.makeAssetCachePath(
-      options.cacheDir,
-      res.locals.cacheKey || res.locals.fetchUrl
-    );
-
-    // Scoped here so the catch block can clean up this request's temp file
-    // without removing the shared cache directory, which a concurrent request
-    // for the same key may be using.
-    let tmpPath;
-    const startTime = process.hrtime();
 
     try {
-      if (fs.existsSync(assetCachePath)) {
-        const firstFile = fs.readdirSync(assetCachePath)[0];
+      const result = await middleWare.cacheAsset(res.locals.fetchUrl, {
+        cacheDir: options.cacheDir,
+        cacheKey: res.locals.cacheKey,
+        maxSize: options.maxSize,
+        onProgress: options.onProgress,
+        logger: options.logger
+      });
 
-        // Empty directory = corrupted cache entry, re-fetch
-        if (!firstFile) {
-          fs.rmdirSync(assetCachePath);
-          // Fall through to the fetch path by pretending the dir doesn't exist
-          return middleWare(options)(req, res, next);
+      // Forward the upstream error to the client so it sees the real failure.
+      // Nothing was cached; the entry self-heals on the next request.
+      if (result.status === "error") {
+        if (result.contentType && typeof res.set === "function") {
+          res.set("Content-Type", result.contentType);
         }
-
-        // touch file for LRU eviction
-        middleWare.touch(`${assetCachePath}/${firstFile}`);
-
-        const [contentType, contentLength] = middleWare.decodeAssetCacheName(
-          firstFile
-        );
-
-        res.locals.contentLength = contentLength;
-        res.locals.contentType = contentType;
-
-        res.locals.buffer = fs.readFileSync(`${assetCachePath}/${firstFile}`);
-
-        const [seconds, nanoSeconds] = process.hrtime(startTime);
-        if (options.logger)
-          options.logger.info(
-            `Read buffer from path ${assetCachePath}/${firstFile} in ${seconds *
-              1000 +
-              nanoSeconds / 1e6} ms`
-          );
-      } else {
-        const response = await fetch(res.locals.fetchUrl);
-
-        // Never cache non-2xx responses: forward the upstream status,
-        // content-type and body so the client sees the real error. Reading the
-        // body also releases the keep-alive socket. The entry self-heals on the
-        // next request.
-        if (!response.ok) {
-          const upstreamType = response.headers.get("content-type");
-          if (upstreamType && typeof res.set === "function") {
-            res.set("Content-Type", upstreamType);
-          }
-          const body = await response.text();
-          return res
-            .status(response.status)
-            .send(body || response.statusText || "Upstream error");
-        }
-
-        // A 2xx response can carry no content to cache (204/205, or a null
-        // body). Respond with the status and short-circuit rather than caching
-        // an empty file.
-        if (
-          response.status === 204 ||
-          response.status === 205 ||
-          !response.body
-        ) {
-          return res.status(response.status).end();
-        }
-
-        // node 10 supports recursive: true, but who knows?
-        middleWare.makeDirIfNotExists(options.cacheDir);
-        middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1));
-        middleWare.makeDirIfNotExists(path.join(options.cacheDir, dir1, dir2));
-        middleWare.makeDirIfNotExists(
-          path.join(options.cacheDir, dir1, dir2, dir3)
-        );
-
-        const contentType = response.headers.get("content-type") || "";
-        const totalHeader = response.headers.get("content-length");
-        const total =
-          totalHeader != null && totalHeader !== ""
-            ? parseInt(totalHeader, 10)
-            : null;
-
-        // Stream to a temp file in the same directory, then atomically rename
-        // into place. A crashed or partial download never corrupts the cache.
-        tmpPath = `${assetCachePath}/.tmp-${crypto
-          .randomBytes(8)
-          .toString("hex")}`;
-
-        let received = 0;
-        const counter = new Transform({
-          transform(chunk, _encoding, callback) {
-            received += chunk.length;
-            if (typeof options.onProgress === "function") {
-              options.onProgress({ received, total });
-            }
-            callback(null, chunk);
-          }
-        });
-
-        // On failure the outer catch removes tmpPath. A partial temp file is
-        // never renamed into place, so the published cache can't be corrupted.
-        await streamPipeline(
-          response.body,
-          counter,
-          fs.createWriteStream(tmpPath)
-        );
-
-        // The number of bytes actually written is authoritative (the
-        // Content-Length header may be missing or wrong for chunked responses).
-        const contentLength = received;
-        const fileName = middleWare.encodeAssetCacheName(
-          contentType,
-          contentLength
-        );
-        const finalPath = `${assetCachePath}/${fileName}`;
-
-        middleWare.evictLeastRecentlyUsed(
-          options.cacheDir,
-          options.maxSize,
-          options.logger
-        );
-
-        try {
-          fs.renameSync(tmpPath, finalPath);
-        } catch (renameErr) {
-          if (renameErr.code === "EEXIST") {
-            // A concurrent request for the same key already published this
-            // asset. Windows rename refuses to overwrite an existing file, so
-            // drop our temp copy and serve the one that is already there.
-            try {
-              fs.unlinkSync(tmpPath);
-            } catch (_) {
-              // ignore cleanup errors
-            }
-          } else {
-            throw renameErr;
-          }
-        }
-        // The temp file is gone (renamed or unlinked); nothing left to clean up.
-        tmpPath = undefined;
-
-        res.locals.contentType = contentType;
-        res.locals.contentLength = String(contentLength);
-        res.locals.buffer = fs.readFileSync(finalPath);
-
-        const [seconds, nanoSeconds] = process.hrtime(startTime);
-        if (options.logger)
-          options.logger.info(
-            `Wrote buffer to path ${finalPath} in ${seconds * 1000 +
-              nanoSeconds / 1e6} ms`
-          );
+        return res
+          .status(result.httpStatus)
+          .send(result.body || result.statusText || "Upstream error");
       }
+
+      // 2xx carrying nothing to cache (204/205, or a null body).
+      if (result.status === "empty") {
+        return res.status(result.httpStatus).end();
+      }
+
+      res.locals.contentType = result.contentType;
+      res.locals.contentLength = result.contentLength;
+      res.locals.buffer = fs.readFileSync(result.path);
 
       if (res && typeof res.set === "function") {
         res.set("Accept-Ranges", "bytes");
@@ -374,27 +434,13 @@ const middleWare = (module.exports = function(options) {
 
       next();
     } catch (e) {
-      // Remove only this request's partial temp file. Never remove the shared
-      // cache directory: a concurrent request for the same key may have just
-      // published a valid file there.
-      if (tmpPath) {
-        try {
-          fs.unlinkSync(tmpPath);
-        } catch (_) {
-          // ignore cleanup errors
-        }
-      }
-
-      if (options.logger)
-        options.logger.error(
-          `Caching asset at ${assetCachePath} failed with error: ${e.message}`
-        );
-
+      // cacheAsset already removed its temp file and logged the cause.
       res.status(500).send(e.message);
     }
   };
 });
 
+middleWare.cacheAsset = cacheAsset;
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
 middleWare.encodeAssetCacheName = encodeAssetCacheName;
