@@ -68,6 +68,38 @@ The asset's `contentType` and `contentLength` are stored base64 encoded in the f
 
 Note that setting `cacheKey` and `cacheDir` isn't strictly necessary, it will fall back to `res.local.fetchUrl` and `path.join(process.cwd(), "/tmp")`, respectively.
 
+## Using it without express: `cacheAsset`
+
+Since 1.6.0 the fetch+cache core is exported on its own, so callers that aren't serving an HTTP request (an Electron main process, a CLI precache, a queue worker) get the same streaming download, atomic rename, LRU accounting and progress reporting without standing up a local server:
+
+```javascript
+const { cacheAsset } = require("express-asset-file-cache-middleware");
+
+const result = await cacheAsset("https://cdn.example.org/big-video.mp4", {
+  cacheDir: "/tmp",
+  cacheKey: someExpirableUniqueKey, // optional, falls back to the URL
+  onProgress: ({ received, total }) => {
+    mainWindow.webContents.send("download:progress", { received, total });
+  }
+});
+
+if (result.status === "cached") {
+  console.log(result.path, result.contentType, result.contentLength);
+}
+```
+
+It resolves to one of three shapes:
+
+| `status`   | Meaning | Fields |
+| ---------- | ------- | ------ |
+| `"cached"` | The asset is on disk and ready to read. | `fromCache` (`false` on a fresh download, `true` on a cache hit), `path`, `contentType`, `contentLength` |
+| `"error"`  | Non-2xx upstream. Nothing was cached; the entry self-heals on the next call. | `httpStatus`, `statusText`, `contentType`, `body` |
+| `"empty"`  | 2xx carrying no body (204/205). Nothing was cached. | `httpStatus` |
+
+Filesystem and stream errors reject instead. `cacheAsset` unlinks its own temp file first, so a failed download never leaves a partial entry behind.
+
+The options are the middleware's (`cacheDir`, `maxSize`, `logger`, `onProgress`) plus `cacheKey`, which the middleware takes from `res.locals.cacheKey`. The middleware is a thin adapter over this function, so both paths share one implementation and behave identically.
+
 ## LRU Eviction
 
 To avoid cluttering your device, an LRU (least recently used) cache eviction strategy is in place. Per default, when your cache dir grows over 1 GB of size, the least recently used (accessed) files will be evicted (deleted), until enough disk space is available again. You can change the cache dir size by specifying `options.maxSize` (in bytes) when creating the middleware.
