@@ -13,9 +13,12 @@ const streamPipeline = promisify(pipeline);
 // lazily via dynamic import() inside evictLeastRecentlyUsed instead.
 
 function makeDirIfNotExists(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir);
-  }
+  // recursive: true is idempotent - it creates any missing parent directories
+  // and, crucially, does NOT throw if the directory already exists. That closes
+  // the check-then-create TOCTOU where two concurrent callers populating the
+  // same key could both pass an existsSync() check and one then throw EEXIST
+  // from mkdirSync (#53).
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 /* from https://github.com/segment-boneyard/hash-mod/blob/master/lib/index.js */
@@ -437,13 +440,17 @@ const middleWare = (module.exports = function(options) {
     options = options || {};
 
     try {
-      const result = await middleWare.cacheAsset(res.locals.fetchUrl, {
+      const cacheOpts = {
         cacheDir: options.cacheDir,
         cacheKey: res.locals.cacheKey,
         maxSize: options.maxSize,
         onProgress: options.onProgress,
         logger: options.logger
-      });
+      };
+      const result = await middleWare.cacheAsset(
+        res.locals.fetchUrl,
+        cacheOpts
+      );
 
       // Forward the upstream error to the client so it sees the real failure.
       // Nothing was cached; the entry self-heals on the next request.
@@ -466,7 +473,24 @@ const middleWare = (module.exports = function(options) {
 
       res.locals.contentType = result.contentType;
       res.locals.contentLength = result.contentLength;
-      res.locals.buffer = fs.readFileSync(result.path);
+      try {
+        res.locals.buffer = fs.readFileSync(result.path);
+      } catch (readErr) {
+        // The chosen cache file vanished between cacheAsset() selecting it and
+        // this read - e.g. LRU eviction or external cleanup unlinked it (a
+        // find()->readFileSync TOCTOU, #53). Re-run cacheAsset once to
+        // re-populate, then read the fresh path. Any second failure propagates
+        // to the 500 handler below.
+        if (readErr.code !== "ENOENT") throw readErr;
+        const retry = await middleWare.cacheAsset(
+          res.locals.fetchUrl,
+          cacheOpts
+        );
+        if (retry.status !== "cached") throw readErr;
+        res.locals.contentType = retry.contentType;
+        res.locals.contentLength = retry.contentLength;
+        res.locals.buffer = fs.readFileSync(retry.path);
+      }
 
       if (res && typeof res.set === "function") {
         res.set("Accept-Ranges", "bytes");
