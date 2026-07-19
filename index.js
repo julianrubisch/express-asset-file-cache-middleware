@@ -447,49 +447,47 @@ const middleWare = (module.exports = function(options) {
         onProgress: options.onProgress,
         logger: options.logger
       };
-      const result = await middleWare.cacheAsset(
-        res.locals.fetchUrl,
-        cacheOpts
-      );
+      // cacheAsset() returns a path, not bytes - the buffer is read below. If
+      // the chosen file is unlinked between selection and read (LRU eviction or
+      // external cleanup: a find()->readFileSync TOCTOU, #53), re-run
+      // cacheAsset once and re-dispatch its FRESH result through the same
+      // error/empty/cached handling. That way a retry that now sees an upstream
+      // error or an empty body is forwarded properly instead of surfacing the
+      // stale ENOENT as a generic 500. Bounded to a single retry; a re-fetch
+      // may fire onProgress / emit logs a second time.
+      let result = await middleWare.cacheAsset(res.locals.fetchUrl, cacheOpts);
 
-      // Forward the upstream error to the client so it sees the real failure.
-      // Nothing was cached; the entry self-heals on the next request.
-      if (result.status === "error") {
-        if (result.contentType && typeof res.set === "function") {
-          // Sanitize: a broken or hostile upstream can return a content-type
-          // with control characters, which would make res.set() throw
-          // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
-          res.set("Content-Type", sanitizeContentType(result.contentType));
+      for (let attempt = 0; ; attempt++) {
+        // Forward the upstream error to the client so it sees the real failure.
+        // Nothing was cached; the entry self-heals on the next request.
+        if (result.status === "error") {
+          if (result.contentType && typeof res.set === "function") {
+            // Sanitize: a broken or hostile upstream can return a content-type
+            // with control characters, which would make res.set() throw
+            // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
+            res.set("Content-Type", sanitizeContentType(result.contentType));
+          }
+          return res
+            .status(result.httpStatus)
+            .send(result.body || result.statusText || "Upstream error");
         }
-        return res
-          .status(result.httpStatus)
-          .send(result.body || result.statusText || "Upstream error");
-      }
 
-      // 2xx carrying nothing to cache (204/205, or a null body).
-      if (result.status === "empty") {
-        return res.status(result.httpStatus).end();
-      }
+        // 2xx carrying nothing to cache (204/205, or a null body).
+        if (result.status === "empty") {
+          return res.status(result.httpStatus).end();
+        }
 
-      res.locals.contentType = result.contentType;
-      res.locals.contentLength = result.contentLength;
-      try {
-        res.locals.buffer = fs.readFileSync(result.path);
-      } catch (readErr) {
-        // The chosen cache file vanished between cacheAsset() selecting it and
-        // this read - e.g. LRU eviction or external cleanup unlinked it (a
-        // find()->readFileSync TOCTOU, #53). Re-run cacheAsset once to
-        // re-populate, then read the fresh path. Any second failure propagates
-        // to the 500 handler below.
-        if (readErr.code !== "ENOENT") throw readErr;
-        const retry = await middleWare.cacheAsset(
-          res.locals.fetchUrl,
-          cacheOpts
-        );
-        if (retry.status !== "cached") throw readErr;
-        res.locals.contentType = retry.contentType;
-        res.locals.contentLength = retry.contentLength;
-        res.locals.buffer = fs.readFileSync(retry.path);
+        res.locals.contentType = result.contentType;
+        res.locals.contentLength = result.contentLength;
+        try {
+          res.locals.buffer = fs.readFileSync(result.path);
+          break;
+        } catch (readErr) {
+          // Only a vanished file (ENOENT) is retriable, and only once. Any
+          // other error, or a second failure, propagates to the 500 handler.
+          if (readErr.code !== "ENOENT" || attempt >= 1) throw readErr;
+          result = await middleWare.cacheAsset(res.locals.fetchUrl, cacheOpts);
+        }
       }
 
       if (res && typeof res.set === "function") {
