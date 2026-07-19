@@ -102,11 +102,15 @@ function parseByteRange(rangeHeader, totalLength) {
 // generic binary type.
 function sanitizeContentType(contentType) {
   const fallback = "application/octet-stream";
-  if (typeof contentType !== "string" || contentType === "") return fallback;
-  // Printable US-ASCII only (no control chars, no CR/LF), as HTTP header
-  // values require.
+  // Preserve whatever the asset was cached with, including an empty string
+  // ("no content type" - unusual, but a valid header value and the behavior
+  // that predates this guard). Only replace a value that would actually make
+  // res.set() throw ERR_INVALID_CHAR (#51). The rejected set matches Node's own
+  // header-value validation exactly: everything except tab, printable US-ASCII,
+  // and latin1 obs-text (\t, 0x20-0x7e, 0x80-0xff).
+  if (typeof contentType !== "string") return fallback;
   // eslint-disable-next-line no-control-regex
-  if (/[^\x20-\x7e]/.test(contentType)) return fallback;
+  if (/[^\t\x20-\x7e\x80-\xff]/.test(contentType)) return fallback;
   return contentType;
 }
 
@@ -445,7 +449,10 @@ const middleWare = (module.exports = function(options) {
       // Nothing was cached; the entry self-heals on the next request.
       if (result.status === "error") {
         if (result.contentType && typeof res.set === "function") {
-          res.set("Content-Type", result.contentType);
+          // Sanitize: a broken or hostile upstream can return a content-type
+          // with control characters, which would make res.set() throw
+          // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
+          res.set("Content-Type", sanitizeContentType(result.contentType));
         }
         return res
           .status(result.httpStatus)

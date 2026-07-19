@@ -267,4 +267,66 @@ describe("tmp-file cache-hit race (#51)", function() {
       expect(hits["/asset"]).to.equal(undefined);
     });
   });
+
+  describe("content-type header hardening", function() {
+    it("preserves a content type Node considers valid (tab / latin1 obs-text)", function() {
+      // Node's setHeader accepts tab (0x09) and 0x80-0xff obs-text; the
+      // sanitizer must not downgrade those to application/octet-stream.
+      const buf = Buffer.from("data");
+      const original = "text/plain; note=café\tx=1"; // é = 0xe9, plus a tab
+      const res = makeStrictRes({
+        buffer: buf,
+        contentType: original,
+        contentLength: String(buf.length)
+      });
+
+      expect(() => middleware.sendBuffer(res.__req, res)).to.not.throw();
+      expect(res.headers["Content-Type"]).to.equal(original);
+    });
+
+    it("preserves an empty content type instead of forcing octet-stream", function() {
+      // An asset cached with no content type (e.g. a chunked response) must
+      // still serve an empty Content-Type, exactly as before the sanitizer.
+      const buf = Buffer.from("data");
+      const res = makeStrictRes({
+        buffer: buf,
+        contentType: "",
+        contentLength: String(buf.length)
+      });
+
+      middleware.sendBuffer(res.__req, res);
+      expect(res.headers["Content-Type"]).to.equal("");
+      expect(res.headers["Content-Length"]).to.equal(buf.length);
+    });
+
+    it("sanitizes an upstream error's content type on the middleware error path", async function() {
+      // A broken/hostile upstream can return a content-type with control
+      // characters on a 4xx/5xx. The middleware forwards the upstream status
+      // and body; setting the raw header would throw ERR_INVALID_CHAR and turn
+      // a forwarded 502 into a generic 500.
+      sinon.stub(middleware, "cacheAsset").resolves({
+        status: "error",
+        httpStatus: 502,
+        statusText: "Bad Gateway",
+        contentType: "text/html\r\nX-Injected: 1",
+        body: "<h1>Bad Gateway</h1>"
+      });
+
+      const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+      const mw = middleware({ cacheDir });
+
+      let threw = false;
+      try {
+        await mw(res.__req, res, () => {});
+      } catch (_) {
+        threw = true;
+      }
+
+      expect(threw, "middleware must not throw").to.equal(false);
+      // Forwarded, not swallowed into a 500.
+      expect(res.statusCode).to.equal(502);
+      expect(String(res._body)).to.contain("Bad Gateway");
+      expect(res.headers["Content-Type"]).to.equal("application/octet-stream");
+    });
+  });
 });
