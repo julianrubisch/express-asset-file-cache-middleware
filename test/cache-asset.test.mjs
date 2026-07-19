@@ -86,6 +86,9 @@ describe("cacheAsset (integration)", function() {
   afterEach(function() {
     sinon.restore();
     fs.rmSync(cacheDir, { recursive: true, force: true });
+    // The coalescing map drains itself, but clear it defensively so a test
+    // that threw mid-flight can't leak an entry into the next one (#54).
+    middleware._inFlight.clear();
   });
 
   // Every file in the cache directory, temp files included.
@@ -243,5 +246,69 @@ describe("cacheAsset (integration)", function() {
     expect(result.status).to.equal("cached");
     expect(result.fromCache).to.equal(false);
     expect(fs.readFileSync(result.path).equals(ASSET)).to.equal(true);
+  });
+
+  // Request coalescing (issue #54): concurrent callers that resolve to the same
+  // cache entry share a single upstream fetch instead of each running their own.
+  describe("coalescing concurrent misses (#54)", function() {
+    it("coalesces concurrent misses into a single upstream fetch", async function() {
+      const [a, b] = await Promise.all([
+        cacheAsset(`${baseUrl}/asset`, { cacheDir }),
+        cacheAsset(`${baseUrl}/asset`, { cacheDir })
+      ]);
+
+      expect(hits["/asset"], "upstream fetched exactly once").to.equal(1);
+      expect(a.status).to.equal("cached");
+      expect(b.status).to.equal("cached");
+      expect(a.path).to.equal(b.path);
+      expect(fs.readFileSync(a.path).equals(ASSET)).to.equal(true);
+      // A single published entry, and the in-flight map has drained.
+      expect(cachedFiles(cacheDir).length).to.equal(1);
+      expect(middleware._inFlight.size).to.equal(0);
+    });
+
+    it("shares one fetch and gives every caller the same error result", async function() {
+      const [a, b] = await Promise.all([
+        cacheAsset(`${baseUrl}/404`, { cacheDir }),
+        cacheAsset(`${baseUrl}/404`, { cacheDir })
+      ]);
+
+      expect(hits["/404"], "upstream fetched once for both").to.equal(1);
+      expect(a.status).to.equal("error");
+      expect(b.status).to.equal("error");
+      expect(a.httpStatus).to.equal(404);
+      expect(middleware._inFlight.size).to.equal(0);
+    });
+
+    it("propagates a mid-stream failure to every coalesced caller and drains the map", async function() {
+      const [a, b] = await Promise.allSettled([
+        cacheAsset(`${baseUrl}/truncated`, { cacheDir }),
+        cacheAsset(`${baseUrl}/truncated`, { cacheDir })
+      ]);
+
+      expect(hits["/truncated"], "one shared fetch").to.equal(1);
+      expect(a.status).to.equal("rejected");
+      expect(b.status).to.equal("rejected");
+      // Both awaiters observe the same error instance from the shared populate.
+      expect(a.reason).to.equal(b.reason);
+      expect(cachedFiles(cacheDir), "no partial entry left behind").to.deep.equal(
+        []
+      );
+      expect(middleware._inFlight.size, "map drained after rejection").to.equal(
+        0
+      );
+    });
+
+    it("does not coalesce calls that resolve to different cache entries", async function() {
+      const [a, b] = await Promise.all([
+        cacheAsset(`${baseUrl}/asset`, { cacheDir, cacheKey: "k1" }),
+        cacheAsset(`${baseUrl}/asset`, { cacheDir, cacheKey: "k2" })
+      ]);
+
+      // Same URL, different keys -> two distinct entries -> two fetches.
+      expect(hits["/asset"]).to.equal(2);
+      expect(a.path).to.not.equal(b.path);
+      expect(middleware._inFlight.size).to.equal(0);
+    });
   });
 });
