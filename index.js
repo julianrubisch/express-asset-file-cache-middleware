@@ -94,10 +94,33 @@ function parseByteRange(rangeHeader, totalLength) {
   return { start, end };
 }
 
+// A cached asset's content type is stored inside the (base64-encoded) file
+// name and normally round-trips cleanly. Should a malformed name ever decode
+// to something with control characters, a raw newline, or non-latin1 bytes,
+// passing it to res.set() throws ERR_INVALID_CHAR and takes down the request.
+// Reject anything that isn't a well-formed header token and fall back to a
+// generic binary type.
+function sanitizeContentType(contentType) {
+  const fallback = "application/octet-stream";
+  // Preserve whatever the asset was cached with, including an empty string
+  // ("no content type" - unusual, but a valid header value and the behavior
+  // that predates this guard). Only replace a value that would actually make
+  // res.set() throw ERR_INVALID_CHAR (#51). The rejected set matches Node's own
+  // header-value validation exactly: everything except tab, printable US-ASCII,
+  // and latin1 obs-text (\t, 0x20-0x7e, 0x80-0xff).
+  if (typeof contentType !== "string") return fallback;
+  // eslint-disable-next-line no-control-regex
+  if (/[^\t\x20-\x7e\x80-\xff]/.test(contentType)) return fallback;
+  return contentType;
+}
+
 function sendBuffer(req, res) {
   const buffer = res.locals.buffer;
   const total = buffer.length;
-  const contentType = res.locals.contentType;
+  // Guard the content-type before it reaches a header. A malformed cache-name
+  // could decode to a value with control/invalid characters, which would make
+  // res.set() throw ERR_INVALID_CHAR (#51). Fall back to a safe default.
+  const contentType = sanitizeContentType(res.locals.contentType);
 
   res.set("Accept-Ranges", "bytes");
 
@@ -126,7 +149,10 @@ function sendBuffer(req, res) {
 
   res.set({
     "Content-Type": contentType,
-    "Content-Length": res.locals.contentLength
+    // Derive Content-Length from the buffer itself. It is always a clean,
+    // non-negative integer; the base64-encoded cache-name in
+    // res.locals.contentLength must not be trusted as a header value (#51).
+    "Content-Length": total
   });
   res.end(buffer, "binary");
 }
@@ -243,37 +269,48 @@ async function cacheAsset(fetchUrl, opts) {
 
   try {
     if (fs.existsSync(assetCachePath)) {
-      const firstFile = fs.readdirSync(assetCachePath)[0];
+      // Ignore in-flight temp files (`.tmp-…`) and any other dotfile. A
+      // concurrent cache-miss for the same key streams to a `.tmp-…` file in
+      // this very directory before atomically renaming it into place, so an
+      // unfiltered readdir()[0] can hand back a half-written temp file whose
+      // name base64-decodes to garbage - producing an invalid Content-Length
+      // header and a truncated body (#51). Only a real cache-name entry is a
+      // hit.
+      const firstFile = fs
+        .readdirSync(assetCachePath)
+        .find(f => !f.startsWith("."));
 
-      // Empty directory = corrupted cache entry, re-fetch
-      if (!firstFile) {
-        fs.rmdirSync(assetCachePath);
-        // Fall through to the fetch path by pretending the dir doesn't exist
-        return middleWare.cacheAsset(fetchUrl, opts);
-      }
+      // A published cache entry exists: serve it.
+      if (firstFile) {
+        // touch file for LRU eviction
+        middleWare.touch(`${assetCachePath}/${firstFile}`);
 
-      // touch file for LRU eviction
-      middleWare.touch(`${assetCachePath}/${firstFile}`);
-
-      const [contentType, contentLength] = middleWare.decodeAssetCacheName(
-        firstFile
-      );
-
-      const [seconds, nanoSeconds] = process.hrtime(startTime);
-      if (logger)
-        logger.info(
-          `Cache hit for path ${assetCachePath}/${firstFile} in ${seconds *
-            1000 +
-            nanoSeconds / 1e6} ms`
+        const [contentType, contentLength] = middleWare.decodeAssetCacheName(
+          firstFile
         );
 
-      return {
-        status: "cached",
-        fromCache: true,
-        path: `${assetCachePath}/${firstFile}`,
-        contentType,
-        contentLength
-      };
+        const [seconds, nanoSeconds] = process.hrtime(startTime);
+        if (logger)
+          logger.info(
+            `Cache hit for path ${assetCachePath}/${firstFile} in ${seconds *
+              1000 +
+              nanoSeconds / 1e6} ms`
+          );
+
+        return {
+          status: "cached",
+          fromCache: true,
+          path: `${assetCachePath}/${firstFile}`,
+          contentType,
+          contentLength
+        };
+      }
+
+      // The directory exists but holds no published entry yet - it is empty,
+      // or a concurrent writer's `.tmp-…` file is the only thing in it. Either
+      // way this is a miss: fall through to the fetch path below. We never
+      // rmdir it or touch the temp file; the concurrent writer owns that file
+      // and renames it into place when its download completes.
     }
 
     const response = await fetch(fetchUrl);
@@ -412,7 +449,10 @@ const middleWare = (module.exports = function(options) {
       // Nothing was cached; the entry self-heals on the next request.
       if (result.status === "error") {
         if (result.contentType && typeof res.set === "function") {
-          res.set("Content-Type", result.contentType);
+          // Sanitize: a broken or hostile upstream can return a content-type
+          // with control characters, which would make res.set() throw
+          // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
+          res.set("Content-Type", sanitizeContentType(result.contentType));
         }
         return res
           .status(result.httpStatus)

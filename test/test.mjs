@@ -269,7 +269,9 @@ describe("Middleware", function() {
       expect(res.statusCode).to.equal(200);
       expect(res.headers["Accept-Ranges"]).to.equal("bytes");
       expect(res.headers["Content-Type"]).to.equal("text/plain");
-      expect(res.headers["Content-Length"]).to.equal(String(buf.length));
+      // Content-Length is derived from the buffer itself (#51): a clean,
+      // numeric length, consistent with the 206 branch's slice.length.
+      expect(res.headers["Content-Length"]).to.equal(buf.length);
       expect(res._body.equals(buf)).to.equal(true);
     });
 
