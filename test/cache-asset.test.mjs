@@ -310,5 +310,37 @@ describe("cacheAsset (integration)", function() {
       expect(a.path).to.not.equal(b.path);
       expect(middleware._inFlight.size).to.equal(0);
     });
+
+    it("coalesces N concurrent callers into a single fetch", async function() {
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () =>
+          cacheAsset(`${baseUrl}/asset`, { cacheDir })
+        )
+      );
+
+      expect(hits["/asset"], "one fetch for all five callers").to.equal(1);
+      expect(results.every(r => r.status === "cached")).to.equal(true);
+      const paths = new Set(results.map(r => r.path));
+      expect(paths.size, "all share the one published entry").to.equal(1);
+      expect(middleware._inFlight.size).to.equal(0);
+    });
+
+    it("gives concurrent same-key callers the first URL's content (first-wins)", async function() {
+      // Same cacheKey + different URLs: consistent with the sequential cacheKey
+      // contract (the second URL is never fetched), now applied deterministically
+      // to the concurrent case. Promise.all invokes the /asset call first, so it
+      // wins and /chunked is never fetched.
+      const [a, b] = await Promise.all([
+        cacheAsset(`${baseUrl}/asset`, { cacheDir, cacheKey: "shared" }),
+        cacheAsset(`${baseUrl}/chunked`, { cacheDir, cacheKey: "shared" })
+      ]);
+
+      expect(a.path).to.equal(b.path);
+      expect(hits["/asset"], "the winner is fetched once").to.equal(1);
+      expect(hits["/chunked"], "the second URL is never fetched").to.equal(
+        undefined
+      );
+      expect(middleware._inFlight.size).to.equal(0);
+    });
   });
 });

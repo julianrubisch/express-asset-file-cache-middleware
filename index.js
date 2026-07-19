@@ -226,10 +226,12 @@ function findLeastRecentlyUsed(dir, result) {
 /**
  * Fetch an asset and cache it on disk, or resolve it straight from the cache.
  *
- * This is the whole download/cache/progress core with no HTTP transport
- * attached, so a non-Express caller (an Electron main process, a CLI precache,
- * a queue worker) can use it directly. The middleware below is a thin adapter
- * over it.
+ * This is the internal download/cache/progress core with no HTTP transport
+ * attached. Public callers - including non-Express ones (an Electron main
+ * process, a CLI precache, a queue worker) - go through the exported cacheAsset
+ * wrapper below, which adds request coalescing; the middleware is a thin
+ * adapter over that. A result object returned here may be shared across
+ * coalesced callers, so treat it as read-only.
  *
  * @param {string} fetchUrl
  * @param {object} [opts]
