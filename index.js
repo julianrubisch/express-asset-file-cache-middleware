@@ -229,10 +229,12 @@ function findLeastRecentlyUsed(dir, result) {
 /**
  * Fetch an asset and cache it on disk, or resolve it straight from the cache.
  *
- * This is the whole download/cache/progress core with no HTTP transport
- * attached, so a non-Express caller (an Electron main process, a CLI precache,
- * a queue worker) can use it directly. The middleware below is a thin adapter
- * over it.
+ * This is the internal download/cache/progress core with no HTTP transport
+ * attached. Public callers - including non-Express ones (an Electron main
+ * process, a CLI precache, a queue worker) - go through the exported cacheAsset
+ * wrapper below, which adds request coalescing; the middleware is a thin
+ * adapter over that. A result object returned here may be shared across
+ * coalesced callers, so treat it as read-only.
  *
  * @param {string} fetchUrl
  * @param {object} [opts]
@@ -250,7 +252,7 @@ function findLeastRecentlyUsed(dir, result) {
  * >}
  *   Rejects on filesystem/stream errors, after unlinking its own temp file.
  */
-async function cacheAsset(fetchUrl, opts) {
+async function cacheAssetInner(fetchUrl, opts) {
   opts = opts || {};
   const cacheDir = opts.cacheDir || path.join(process.cwd(), "/tmp");
   const maxSize = opts.maxSize || 1024 * 1024 * 1024;
@@ -435,6 +437,47 @@ async function cacheAsset(fetchUrl, opts) {
   }
 }
 
+// Concurrent cache MISSES for the same cache location would otherwise each run
+// their own upstream fetch and race their own temp files into the same final
+// name. This map coalesces them: the first caller to reach a given resolved
+// cache path starts the populate, and every concurrent caller for that same
+// path awaits the one shared promise instead of fetching again (#54). The entry
+// is removed as soon as that promise settles, so a later request re-populates
+// or hits the cache normally.
+const inFlight = new Map();
+
+/**
+ * Public entry point. Same arguments and return contract as cacheAssetInner
+ * (see its JSDoc above), plus request coalescing.
+ *
+ * Coalescing is keyed by the resolved assetCachePath - derived from (cacheDir,
+ * cacheKey) - so two calls share a fetch only when they target the exact same
+ * cache entry. A coalesced (secondary) caller receives the winner's result but
+ * does NOT run its own fetch, so only the first caller's onProgress / logger
+ * fire for that download. If the shared populate rejects (or resolves to an
+ * "error"/"empty" result), every awaiter observes the same outcome.
+ */
+async function cacheAsset(fetchUrl, opts) {
+  opts = opts || {};
+  const cacheDir = opts.cacheDir || path.join(process.cwd(), "/tmp");
+  const cacheKey = opts.cacheKey || fetchUrl;
+  const { path: assetCachePath } = middleWare.makeAssetCachePath(
+    cacheDir,
+    cacheKey
+  );
+
+  const existing = inFlight.get(assetCachePath);
+  if (existing) return existing;
+
+  const pending = middleWare.cacheAssetInner(fetchUrl, opts);
+  inFlight.set(assetCachePath, pending);
+  try {
+    return await pending;
+  } finally {
+    inFlight.delete(assetCachePath);
+  }
+}
+
 const middleWare = (module.exports = function(options) {
   return async function(req, res, next) {
     options = options || {};
@@ -503,6 +546,9 @@ const middleWare = (module.exports = function(options) {
 });
 
 middleWare.cacheAsset = cacheAsset;
+middleWare.cacheAssetInner = cacheAssetInner;
+// Exposed for tests to assert the coalescing map drains after each request.
+middleWare._inFlight = inFlight;
 middleWare.makeAssetCachePath = makeAssetCachePath;
 middleWare.makeDirIfNotExists = makeDirIfNotExists;
 middleWare.encodeAssetCacheName = encodeAssetCacheName;
