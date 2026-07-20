@@ -13,9 +13,12 @@ const streamPipeline = promisify(pipeline);
 // lazily via dynamic import() inside evictLeastRecentlyUsed instead.
 
 function makeDirIfNotExists(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir);
-  }
+  // recursive: true is idempotent - it creates any missing parent directories
+  // and, crucially, does NOT throw if the directory already exists. That closes
+  // the check-then-create TOCTOU where two concurrent callers populating the
+  // same key could both pass an existsSync() check and one then throw EEXIST
+  // from mkdirSync (#53).
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 /* from https://github.com/segment-boneyard/hash-mod/blob/master/lib/index.js */
@@ -437,36 +440,55 @@ const middleWare = (module.exports = function(options) {
     options = options || {};
 
     try {
-      const result = await middleWare.cacheAsset(res.locals.fetchUrl, {
+      const cacheOpts = {
         cacheDir: options.cacheDir,
         cacheKey: res.locals.cacheKey,
         maxSize: options.maxSize,
         onProgress: options.onProgress,
         logger: options.logger
-      });
+      };
+      // cacheAsset() returns a path, not bytes - the buffer is read below. If
+      // the chosen file is unlinked between selection and read (LRU eviction or
+      // external cleanup: a find()->readFileSync TOCTOU, #53), re-run
+      // cacheAsset once and re-dispatch its FRESH result through the same
+      // error/empty/cached handling. That way a retry that now sees an upstream
+      // error or an empty body is forwarded properly instead of surfacing the
+      // stale ENOENT as a generic 500. Bounded to a single retry; a re-fetch
+      // may fire onProgress / emit logs a second time.
+      let result = await middleWare.cacheAsset(res.locals.fetchUrl, cacheOpts);
 
-      // Forward the upstream error to the client so it sees the real failure.
-      // Nothing was cached; the entry self-heals on the next request.
-      if (result.status === "error") {
-        if (result.contentType && typeof res.set === "function") {
-          // Sanitize: a broken or hostile upstream can return a content-type
-          // with control characters, which would make res.set() throw
-          // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
-          res.set("Content-Type", sanitizeContentType(result.contentType));
+      for (let attempt = 0; ; attempt++) {
+        // Forward the upstream error to the client so it sees the real failure.
+        // Nothing was cached; the entry self-heals on the next request.
+        if (result.status === "error") {
+          if (result.contentType && typeof res.set === "function") {
+            // Sanitize: a broken or hostile upstream can return a content-type
+            // with control characters, which would make res.set() throw
+            // ERR_INVALID_CHAR (#51) - the same failure, on the error path.
+            res.set("Content-Type", sanitizeContentType(result.contentType));
+          }
+          return res
+            .status(result.httpStatus)
+            .send(result.body || result.statusText || "Upstream error");
         }
-        return res
-          .status(result.httpStatus)
-          .send(result.body || result.statusText || "Upstream error");
-      }
 
-      // 2xx carrying nothing to cache (204/205, or a null body).
-      if (result.status === "empty") {
-        return res.status(result.httpStatus).end();
-      }
+        // 2xx carrying nothing to cache (204/205, or a null body).
+        if (result.status === "empty") {
+          return res.status(result.httpStatus).end();
+        }
 
-      res.locals.contentType = result.contentType;
-      res.locals.contentLength = result.contentLength;
-      res.locals.buffer = fs.readFileSync(result.path);
+        res.locals.contentType = result.contentType;
+        res.locals.contentLength = result.contentLength;
+        try {
+          res.locals.buffer = fs.readFileSync(result.path);
+          break;
+        } catch (readErr) {
+          // Only a vanished file (ENOENT) is retriable, and only once. Any
+          // other error, or a second failure, propagates to the 500 handler.
+          if (readErr.code !== "ENOENT" || attempt >= 1) throw readErr;
+          result = await middleWare.cacheAsset(res.locals.fetchUrl, cacheOpts);
+        }
+      }
 
       if (res && typeof res.set === "function") {
         res.set("Accept-Ranges", "bytes");

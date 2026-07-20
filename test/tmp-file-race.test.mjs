@@ -329,4 +329,204 @@ describe("tmp-file cache-hit race (#51)", function() {
       expect(res.headers["Content-Type"]).to.equal("application/octet-stream");
     });
   });
+
+  // Follow-up concurrency hardening (issue #53).
+  describe("concurrency hardening (#53)", function() {
+    describe("makeDirIfNotExists (recursive, EEXIST-safe)", function() {
+      it("creates missing parent directories", function() {
+        const nested = path.join(cacheDir, "a", "b", "c");
+        middleware.makeDirIfNotExists(nested);
+        expect(fs.existsSync(nested)).to.equal(true);
+      });
+
+      it("is idempotent: repeating on an existing dir does not throw EEXIST", function() {
+        const dir = path.join(cacheDir, "x", "y");
+        middleware.makeDirIfNotExists(dir);
+        // Old code was `if (!existsSync) mkdirSync(dir)`; a concurrent caller
+        // that lost the check-then-create race hit EEXIST. Recursive mkdir
+        // drops the existsSync check entirely and is idempotent, so "the dir
+        // already exists when mkdir runs" - the exact outcome of a lost race -
+        // is a clean no-op. (mkdirSync is synchronous, so a genuinely
+        // concurrent call can't be simulated in-process; this repeat call
+        // captures the property that matters.)
+        expect(() => middleware.makeDirIfNotExists(dir)).to.not.throw();
+        expect(fs.existsSync(dir)).to.equal(true);
+      });
+    });
+
+    describe("ENOENT re-fetch on the read TOCTOU", function() {
+      it("re-fetches when the selected cache file vanished before it is read", async function() {
+        const evicted = path.join(cacheDir, "evicted-blob"); // never created
+        const repopulated = path.join(cacheDir, "repopulated");
+        fs.writeFileSync(repopulated, ASSET);
+
+        const stub = sinon.stub(middleware, "cacheAsset");
+        stub.onFirstCall().resolves({
+          status: "cached",
+          fromCache: true,
+          path: evicted, // unlinked between selection and read
+          contentType: "image/png",
+          contentLength: String(ASSET.length)
+        });
+        stub.onSecondCall().resolves({
+          status: "cached",
+          fromCache: false,
+          path: repopulated, // the retry re-populates
+          contentType: "image/png",
+          contentLength: String(ASSET.length)
+        });
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nextErr;
+        let nexted = false;
+        await mw(res.__req, res, err => {
+          nextErr = err;
+          nexted = true;
+        });
+
+        expect(nextErr, "no error to next()").to.equal(undefined);
+        expect(nexted, "middleware continued via next()").to.equal(true);
+        expect(stub.calledTwice, "cacheAsset retried exactly once").to.equal(
+          true
+        );
+        expect(res.locals.buffer.equals(ASSET)).to.equal(true);
+        expect(res.locals.contentType).to.equal("image/png");
+      });
+
+      it("does not retry a non-ENOENT read error; surfaces a 500", async function() {
+        const stub = sinon.stub(middleware, "cacheAsset").resolves({
+          status: "cached",
+          fromCache: true,
+          path: path.join(cacheDir, "whatever"),
+          contentType: "image/png",
+          contentLength: "10"
+        });
+        const eacces = new Error("EACCES: permission denied");
+        eacces.code = "EACCES";
+        sinon.stub(fs, "readFileSync").throws(eacces);
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nexted = false;
+        await mw(res.__req, res, () => {
+          nexted = true;
+        });
+
+        expect(stub.calledOnce, "no retry for a non-ENOENT error").to.equal(
+          true
+        );
+        expect(nexted).to.equal(false);
+        expect(res.statusCode).to.equal(500);
+        // The real error reaches the client, not a swallowed generic message.
+        expect(String(res._body)).to.contain("EACCES");
+      });
+
+      it("500s when the re-fetch still cannot be read", async function() {
+        const missing = path.join(cacheDir, "still-gone");
+        const stub = sinon.stub(middleware, "cacheAsset").resolves({
+          status: "cached",
+          fromCache: true,
+          path: missing, // both the initial selection and the retry are gone
+          contentType: "image/png",
+          contentLength: "10"
+        });
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nexted = false;
+        await mw(res.__req, res, () => {
+          nexted = true;
+        });
+
+        expect(stub.calledTwice, "retried once, then gave up").to.equal(true);
+        expect(nexted).to.equal(false);
+        expect(res.statusCode).to.equal(500);
+      });
+
+      it("forwards an upstream error when the retry no longer finds the asset", async function() {
+        // Double race: the first selection's file was evicted (ENOENT), and by
+        // the time we re-fetch the upstream now fails. The retry's error result
+        // must be forwarded, not masked as a generic 500 carrying a stale ENOENT.
+        const stub = sinon.stub(middleware, "cacheAsset");
+        stub.onFirstCall().resolves({
+          status: "cached",
+          fromCache: true,
+          path: path.join(cacheDir, "evicted"), // gone -> ENOENT on read
+          contentType: "image/png",
+          contentLength: "10"
+        });
+        stub.onSecondCall().resolves({
+          status: "error",
+          httpStatus: 404,
+          statusText: "Not Found",
+          contentType: "text/html",
+          body: "<h1>gone</h1>"
+        });
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nexted = false;
+        await mw(res.__req, res, () => {
+          nexted = true;
+        });
+
+        expect(stub.calledTwice).to.equal(true);
+        expect(nexted, "error is forwarded, not passed to next()").to.equal(
+          false
+        );
+        expect(res.statusCode).to.equal(404);
+        expect(String(res._body)).to.contain("gone");
+      });
+
+      it("forwards an empty (204) upstream result on the retry", async function() {
+        const stub = sinon.stub(middleware, "cacheAsset");
+        stub.onFirstCall().resolves({
+          status: "cached",
+          fromCache: true,
+          path: path.join(cacheDir, "evicted"),
+          contentType: "image/png",
+          contentLength: "10"
+        });
+        stub.onSecondCall().resolves({ status: "empty", httpStatus: 204 });
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nexted = false;
+        await mw(res.__req, res, () => {
+          nexted = true;
+        });
+
+        expect(stub.calledTwice).to.equal(true);
+        expect(nexted).to.equal(false);
+        expect(res.statusCode).to.equal(204);
+      });
+
+      it("recovers via a real re-fetch when the first read hits ENOENT (integration)", async function() {
+        // No cacheAsset stub: exercise the real miss->populate->hit path. Only
+        // the FIRST fs.readFileSync is forced to ENOENT (simulating eviction
+        // between selection and read); the retry re-runs the real cacheAsset
+        // (now a cache hit) and the second, real read returns the asset.
+        const enoent = new Error("ENOENT: file vanished");
+        enoent.code = "ENOENT";
+        const readStub = sinon.stub(fs, "readFileSync");
+        readStub.onFirstCall().throws(enoent);
+        readStub.callThrough();
+
+        const res = makeStrictRes({ fetchUrl: `${baseUrl}/asset` });
+        const mw = middleware({ cacheDir });
+        let nextErr;
+        let nexted = false;
+        await mw(res.__req, res, err => {
+          nextErr = err;
+          nexted = true;
+        });
+
+        expect(nextErr, "no error to next()").to.equal(undefined);
+        expect(nexted, "recovered and continued").to.equal(true);
+        expect(res.locals.buffer.equals(ASSET)).to.equal(true);
+        expect(res.locals.contentType).to.equal("image/png");
+      });
+    });
+  });
 });
